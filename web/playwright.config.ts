@@ -1,0 +1,30 @@
+import { defineConfig, devices } from "@playwright/test";
+
+// エミュレータ（auth・firestore）が起動している前提。CI では firebase emulators:exec の中で実行する。
+const emulatorEnv = {
+  FIRESTORE_EMULATOR_HOST: "127.0.0.1:8080",
+  FIREBASE_AUTH_EMULATOR_HOST: "127.0.0.1:9099",
+  GOOGLE_CLOUD_PROJECT: "demo-t167",
+  GEMINI_MOCK: "1",
+  PORT: "8081",
+};
+
+export default defineConfig({
+  testDir: "e2e",
+  timeout: 60_000,
+  retries: process.env.CI ? 1 : 0,
+  reporter: process.env.CI ? [["list"], ["html", { open: "never" }]] : "list",
+  use: {
+    baseURL: "http://127.0.0.1:3000",
+    trace: "retain-on-failure",
+    // ブラウザを別の場所に置いている環境では PW_CHROMIUM_PATH で指定する
+    launchOptions: process.env.PW_CHROMIUM_PATH ? { executablePath: process.env.PW_CHROMIUM_PATH } : {},
+  },
+  projects: [
+    { name: "mobile", use: { ...devices["Pixel 7"] } },
+  ],
+  webServer: [
+    { command: "npm --prefix ../api run start", url: "http://127.0.0.1:8081/healthz", env: emulatorEnv, reuseExistingServer: !process.env.CI },
+    { command: "npm run start -- -H 127.0.0.1 -p 3000", url: "http://127.0.0.1:3000", reuseExistingServer: !process.env.CI },
+  ],
+});

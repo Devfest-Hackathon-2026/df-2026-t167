@@ -1,0 +1,18 @@
+# 秘密情報（コミットしない）
+.env
+.env.*
+!.env.example
+.dev.vars
+*.pem
+*.p12
+*-key.json
+# 依存関係・生成物
+node_modules/
+dist/
+.next/
+web/test-results/
+web/playwright-report/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.firebase/
