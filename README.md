@@ -62,6 +62,8 @@
 
 ### API と認可
 
+画面は下のパスに`/api`を付けて呼ぶ。公開確認URLの`/api/healthz`は、Next.jsがCloud Runの`/health`へ転送する。`/api/health`も使える。Cloud Runの予約パスを避け、API自身のJSONを確認するため。`gemini: "gemini"`は接続設定を示し、生成の成功を保証するものではない。
+
 | エンドポイント | ログイン | 部屋の所属 | 司会者 | フェーズ |
 |---|---|---|---|---|
 | `GET /health` | 不要 | — | — | — |
