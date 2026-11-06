@@ -19,11 +19,12 @@ export type ServerRecordingStatus = "analyzing" | "done" | "failed" | undefined;
  * - 録音中にページを離れようとしたら、ブラウザに確かめさせる
  */
 export function useGroupRecording(roomId: string, discussing: boolean, serverStatus: ServerRecordingStatus) {
-  const rec = useRecorder();
-  const { stop, state, elapsedMs } = rec;
+  const rec = useRecorder(roomId);
+  const { stop, state, elapsedMs, discard: discardRecorder } = rec;
   const [upload, setUpload] = useState<{ state: UploadState; message?: string }>({ state: "none" });
   const pending = useRef<{ blob: Blob; durationMs: number } | null>(null);
   const finishing = useRef(false);
+  const discarding = useRef(false);
   const inFlight = useRef(false);
 
   const retry = useCallback(async () => {
@@ -51,7 +52,7 @@ export function useGroupRecording(roomId: string, discussing: boolean, serverSta
   }, [serverStatus, upload.state]);
 
   const finish = useCallback(async () => {
-    if (finishing.current) return;
+    if (finishing.current || discarding.current) return;
     finishing.current = true;
     try {
       const r = await stop();
@@ -59,11 +60,18 @@ export function useGroupRecording(roomId: string, discussing: boolean, serverSta
     } finally { finishing.current = false; }
   }, [stop, retry]);
 
+  /** 録音への同意が取り消されたら、送らずに捨てる（議論の終了と重なっても送信しない） */
+  const discard = useCallback(async () => {
+    discarding.current = true;
+    try { pending.current = null; await discardRecorder(); setUpload({ state: "none" }); }
+    finally { discarding.current = false; }
+  }, [discardRecorder]);
+
   const active = state === "recording" || state === "paused";
-  useEffect(() => { if (!discussing && active) void finish(); }, [discussing, active, finish]);
+  useEffect(() => { if (!discussing && (active || (state === "stopped" && upload.state === "none"))) void finish(); }, [discussing, active, state, upload.state, finish]);
   useEffect(() => { if (state === "recording" && elapsedMs >= MAX_RECORDING_MS) void finish(); }, [state, elapsedMs, finish]);
   // 録音中・未送信の録音があるときにページを離れると、録音が消える
-  const unsaved = active || upload.state === "failed" || upload.state === "waiting";
+  const unsaved = active || upload.state === "uploading" || upload.state === "failed" || upload.state === "waiting";
   useEffect(() => {
     if (!unsaved) return;
     const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); };
@@ -71,5 +79,5 @@ export function useGroupRecording(roomId: string, discussing: boolean, serverSta
     return () => window.removeEventListener("beforeunload", warn);
   }, [unsaved]);
 
-  return { rec, upload, retry, unsaved };
+  return { rec, upload, retry, discard, unsaved };
 }

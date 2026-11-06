@@ -3,28 +3,35 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Loading } from "@/components/ui";
-import { canUseTestHost, signInAsHost, signInAsTestHost, signInAsTestStudent, useHostUser } from "@/lib/hostAuth";
-import { getRole, homeOf } from "@/lib/local";
+import { canUseTestHost, signInAsHost, signInAsTestHost, signInAsTestStudent, useHostUser, type LoginOptions } from "@/lib/hostAuth";
+import { logoutMessage, useAppSession } from "@/lib/session";
+
 
 /**
- * ログイン（入口はここだけ）。Google でログインし、初めての人は役割（生徒・先生）を選ぶ画面へ進む。
- * 参加コードだけで議論に入る道も残す（スマホで30秒以内に参加するため）。
+ * ログイン（入口はここだけ）。Google でログインし、共通ホームへ進む。
+ * 参加コードの入力は、ログイン後のホームから進む。
  */
 export default function Login() {
   const router = useRouter();
   const user = useHostUser();
+  const session = useAppSession();
+  const [shared, setShared] = useState(false);
+  const [end, setEnd] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!user) return;
-    const role = getRole(user.uid);
-    router.replace(role ? homeOf(role) : "/signup");
+    router.replace("/home");
   }, [user, router]);
 
-  async function login(how: () => Promise<void>) {
+  async function login(how: (options: LoginOptions) => Promise<void>) {
     setBusy(true); setError("");
-    try { await how(); } catch (e) { setError(`ログインできませんでした：${(e as Error).message}`); setBusy(false); }
+    try {
+      const classEndsAt = shared ? new Date(end).getTime() : null;
+      if (shared && (!classEndsAt || classEndsAt <= Date.now())) throw new Error("授業終了時刻を指定してください");
+      await how({ isSharedDevice: shared, classEndsAt });
+    } catch (e) { setError(`ログインできませんでした：${(e as Error).message}`); setBusy(false); }
   }
 
   if (user === undefined || user) return <Loading />;
@@ -36,6 +43,10 @@ export default function Login() {
       </section>
       <section className="login__panel">
         <h2 className="t-md">ログイン</h2>
+        {session.reason && <p className="notice" role="status">{logoutMessage(session.reason, session.policy?.idleDays)}</p>}
+        {session.message && <p role="alert">{session.message}</p>}
+        <label className="t-note"><input type="checkbox" checked={shared} onChange={(e) => setShared(e.target.checked)} /> 学校の共用端末で利用する</label>
+        {shared && <label className="field">授業終了時刻<input aria-label="授業終了時刻" type="datetime-local" value={end} onChange={(e) => setEnd(e.target.value)} required /></label>}
         <p className="t-note">はじめての方も、ここからはじめられます。</p>
         <button className="btn btn--yellow btn--block" onClick={() => login(signInAsHost)} disabled={busy}>{busy ? "ログインしています…" : "Googleでログイン"}</button>
         {canUseTestHost && (
@@ -46,8 +57,7 @@ export default function Login() {
         )}
         {error && <p className="notice notice--error" role="alert">{error}</p>}
         <div style={{ borderTop: "3px solid #000", paddingTop: 16, marginTop: 8 }} className="stack stack--tight">
-          <p className="t-note">先生から参加コードを聞いた生徒は、ログインしなくても参加できます。</p>
-          <Link href="/join" className="btn btn--blue btn--block">ログインせずに参加コードを入力する</Link>
+          <p className="t-note">Googleでログインしてホームを開き、参加コードを入力してください。</p>
           <Link href="/about" className="t-note" style={{ color: "inherit" }}>使い方とプライバシー</Link>
         </div>
       </section>
