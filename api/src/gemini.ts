@@ -3,10 +3,26 @@ import { z } from 'zod';
 
 export interface Point { summary: string; discussed: boolean }
 export interface Comparison { groups: { label: string; members: number[] }[]; addressedInsightIds: string[] }
+/**
+ * 音声の議論の分析（チームドキュメント「仕様」の F04）。観測された事実（at：録音の経過時間 mm:ss と、該当する発言の要約）と、
+ * AI の解釈（よかった点・見直す点・先生への提案）を分ける。画面の「議論の流れ」（web/src/lib/room.ts の Flow）と同じ形を含む。
+ */
+export interface Moment { at: string; text: string }
+export interface Discussion {
+  speechDetected: boolean;
+  totalMinutes: number;
+  segments: { topic: string; minutes: number; highlight?: boolean }[];
+  flowNote: string;
+  good: Moment[];
+  review: (Moment & { question?: string })[];
+  behaviors: { questions: Moment[]; responses: Moment[]; reasoning: Moment[]; collaboration: Moment[] };
+  teacherSuggestions: string[];
+}
 export interface Gemini {
   readonly source: 'gemini' | 'mock';
   findPoints(opinions: string[], messages: string[]): Promise<Point[]>;
   compare(statements: string[], insights: { id: string; summary: string }[], messagesAfterApproval: string[]): Promise<Comparison>;
+  analyzeDiscussion(input: { audio: Buffer; mimeType: string; durationSec: number; theme: string }): Promise<Discussion>;
 }
 
 const PointsSchema = z.object({ points: z.array(z.object({ summary: z.string().min(1).max(200), discussed: z.boolean() })).max(20) });
@@ -15,9 +31,40 @@ const CompareSchema = z.object({
   addressedInsightIds: z.array(z.string()).max(50),
 });
 
+/** 録音の経過時間を "m:ss" にそろえる（"1:02:03" は分にまとめる）。形が違えばそのまま残す（画面はそのまま出す） */
+export function normalizeAt(at: string): string {
+  const t = at.trim();
+  const hms = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(t);
+  if (hms) return `${Number(hms[1]) * 60 + Number(hms[2])}:${hms[3]}`;
+  return t.slice(0, 20);
+}
+// Gemini の出力が多すぎる・長すぎるときは、拒否せずに切り詰める（temperature 0 なので、拒否すると送り直しても同じく失敗する）
+const text = (max: number) => z.string().min(1).transform((s) => s.slice(0, max));
+const list = <T extends z.ZodTypeAny>(item: T, max: number) => z.array(item).transform((a) => a.slice(0, max));
+const minutes = z.number().transform((n) => Math.min(Math.max(n, 0), 120));
+const AT = z.string().min(1).transform(normalizeAt);
+const MomentSchema = z.object({ at: AT, text: text(200) });
+/** 出力の件数の上限。プロンプトと responseSchema にも同じ数を書く */
+export const DISCUSSION_LIMITS = { segments: 12, good: 6, review: 6, behaviors: 8, teacherSuggestions: 5 } as const;
+export const DiscussionSchema = z.object({
+  speechDetected: z.boolean(),
+  totalMinutes: minutes,
+  segments: list(z.object({ topic: text(40), minutes, highlight: z.boolean().optional() }), DISCUSSION_LIMITS.segments),
+  flowNote: z.string().transform((s) => s.slice(0, 300)),
+  good: list(MomentSchema, DISCUSSION_LIMITS.good),
+  review: list(MomentSchema.extend({ question: z.string().transform((s) => s.slice(0, 200)).optional() }), DISCUSSION_LIMITS.review),
+  behaviors: z.object({
+    questions: list(MomentSchema, DISCUSSION_LIMITS.behaviors), responses: list(MomentSchema, DISCUSSION_LIMITS.behaviors),
+    reasoning: list(MomentSchema, DISCUSSION_LIMITS.behaviors), collaboration: list(MomentSchema, DISCUSSION_LIMITS.behaviors),
+  }),
+  teacherSuggestions: list(text(200), DISCUSSION_LIMITS.teacherSuggestions),
+});
+
 const TIMEOUT_MS = 20_000;
-function withTimeout<T>(p: Promise<T>): Promise<T> {
-  return Promise.race([p, new Promise<T>((_, reject) => setTimeout(() => reject(new Error('gemini_timeout')), TIMEOUT_MS))]);
+/** 音声の分析は長い（30分の録音を聞き取って構造化する）。Cloud Run の既定のタイムアウト 300 秒より短くする */
+const AUDIO_TIMEOUT_MS = 180_000;
+function withTimeout<T>(p: Promise<T>, ms = TIMEOUT_MS): Promise<T> {
+  return Promise.race([p, new Promise<T>((_, reject) => setTimeout(() => reject(new Error('gemini_timeout')), ms))]);
 }
 
 /**
@@ -42,8 +89,51 @@ export function vertexGemini(project: string, location: string, model: string): 
     }));
     return parse.parse(JSON.parse(res.text ?? '{}'));
   }
+  const moment = { type: Type.OBJECT, properties: { at: { type: Type.STRING }, text: { type: Type.STRING } }, required: ['at', 'text'] };
+  const L = DISCUSSION_LIMITS;
+  const moments = (max: number) => ({ type: Type.ARRAY, items: moment, maxItems: String(max) });
+  const discussionSchema = {
+    type: Type.OBJECT,
+    properties: {
+      speechDetected: { type: Type.BOOLEAN },
+      totalMinutes: { type: Type.NUMBER },
+      segments: { type: Type.ARRAY, maxItems: String(L.segments), items: { type: Type.OBJECT, properties: { topic: { type: Type.STRING }, minutes: { type: Type.NUMBER }, highlight: { type: Type.BOOLEAN } }, required: ['topic', 'minutes'] } },
+      flowNote: { type: Type.STRING },
+      good: moments(L.good),
+      review: { type: Type.ARRAY, maxItems: String(L.review), items: { type: Type.OBJECT, properties: { at: { type: Type.STRING }, text: { type: Type.STRING }, question: { type: Type.STRING } }, required: ['at', 'text'] } },
+      behaviors: { type: Type.OBJECT, properties: { questions: moments(L.behaviors), responses: moments(L.behaviors), reasoning: moments(L.behaviors), collaboration: moments(L.behaviors) }, required: ['questions', 'responses', 'reasoning', 'collaboration'] },
+      teacherSuggestions: { type: Type.ARRAY, maxItems: String(L.teacherSuggestions), items: { type: Type.STRING } },
+    },
+    required: ['speechDetected', 'totalMinutes', 'segments', 'flowNote', 'good', 'review', 'behaviors', 'teacherSuggestions'],
+  };
   return {
     source: 'gemini',
+    async analyzeDiscussion({ audio, mimeType, durationSec, theme }) {
+      const prompt = [
+        'あなたは、中学・高校・大学のグループ学習を見守る記録係です。添付の音声は、1つのグループの話し合いを1台の端末で録音したものです。',
+        `テーマ：${theme}`,
+        `録音の長さ：約${Math.max(1, Math.round(durationSec / 60))}分`,
+        '話し合いの流れと、対話の行動（質問・応答・根拠の提示・協働）を分析してください。',
+        '# 守ること',
+        '- 「観測された事実」と「解釈」を分ける。behaviors・good・review の text は、実際の発言を短く言い換えたもので、at はその発言の録音の経過時間（mm:ss）。',
+        '- 根拠となる発言がないことは書かない。推測で補わない。',
+        '- 話者を特定しない。名前や「〜さん」などの個人を指す表現を使わず、「ある人が」「グループで」と書く。',
+        '- 発言が少ない人がいても、傾聴力や意欲が低いと判断しない。発言から人格や性格を推定しない。',
+        '- 改善点（review）は、次の議論で実際に試せる行動として書く。question には、そのとき投げかけるとよかった問いを1つ書く。',
+        '- 成績や点数をつけない。',
+        '- segments は話題ごとの区切りで、minutes の合計が totalMinutes とおおむね一致する。テーマから離れた区切りは highlight を true にする。',
+        '- teacherSuggestions は、先生が次の授業で確かめるとよい点（役割の交代、問いかけ方など）。個人を名指ししない。',
+        `- 件数は、segments ${DISCUSSION_LIMITS.segments}・good ${DISCUSSION_LIMITS.good}・review ${DISCUSSION_LIMITS.review}・behaviors の各項目 ${DISCUSSION_LIMITS.behaviors}・teacherSuggestions ${DISCUSSION_LIMITS.teacherSuggestions} まで。大事なものから選ぶ。text は100字以内、topic は20字以内。`,
+        '- 会話がほとんど聞き取れない場合は speechDetected を false にし、ほかの項目は空にする。',
+        '- すべて日本語で書く。',
+      ].join('\n');
+      const res = await withTimeout(ai.models.generateContent({
+        model,
+        contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType, data: audio.toString('base64') } }] }],
+        config: { ...GENERATION_CONFIG, responseSchema: discussionSchema },
+      }), AUDIO_TIMEOUT_MS);
+      return DiscussionSchema.parse(JSON.parse(res.text ?? '{}'));
+    },
     async findPoints(opinions, messages) {
       const prompt = [
         'あなたはグループディスカッションの記録係です。',
@@ -77,8 +167,31 @@ export function mockGemini(opts: { fail?: () => boolean; delayMs?: () => number 
     if (opts.fail?.()) throw new Error('gemini_mock_failure');
   };
   const key = (s: string) => s.replace(/\s/g, '').slice(0, 4);
+  const mmss = (sec: number) => `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
   return {
     source: 'mock',
+    /** 音声の中身は聞かず、長さだけから決まった見本を返す（同じ長さなら同じ結果） */
+    async analyzeDiscussion({ durationSec, theme }) {
+      await maybeFail();
+      const total = Math.max(1, Math.round(durationSec / 60));
+      const at = (r: number) => mmss(Math.floor(durationSec * r));
+      const first = Math.max(1, Math.round(total * 0.6));
+      return {
+        speechDetected: true,
+        totalMinutes: total,
+        segments: [{ topic: theme.slice(0, 20) || '本題', minutes: first }, { topic: 'まとめ', minutes: total - first }].filter((s) => s.minutes > 0),
+        flowNote: 'デモデータです。本物の Gemini では、録音から話題の流れを読み取ります。',
+        good: [{ at: at(0.2), text: 'ある人の提案に、理由を尋ねる質問が出た' }],
+        review: [{ at: at(0.7), text: '結論の前に、まだ話していない意見がないか確かめるとよかった', question: 'ほかの考えの人はいますか？' }],
+        behaviors: {
+          questions: [{ at: at(0.2), text: '提案の理由を尋ねた' }],
+          responses: [{ at: at(0.3), text: '質問に具体例で答えた' }],
+          reasoning: [{ at: at(0.4), text: '経験を根拠に意見を述べた' }],
+          collaboration: [{ at: at(0.8), text: '出た意見を2つに整理した' }],
+        },
+        teacherSuggestions: ['次回は記録係と進行役を交代し、まとめる役を別の人が経験できるようにする'],
+      };
+    },
     async findPoints(opinions, messages) {
       await maybeFail();
       const joined = messages.join('\n');

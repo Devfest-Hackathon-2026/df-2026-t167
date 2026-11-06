@@ -29,6 +29,13 @@ export function useFlow(roomId: string, group: number | undefined, geminiSource:
 }
 
 const PENDING = "音声の分析が届くと、ここに表示されます。";
+const NO_SPEECH = "録音から議論を聞き取れませんでした。";
+
+/** 分析の時刻（"6:30"）を「6分30秒ごろ」にする。見本の「6分ごろ」はそのまま */
+const atLabel = (at: string) => {
+  const m = /^(\d+):(\d{2})$/.exec(at);
+  return m ? `${Number(m[1])}分${Number(m[2]) ? `${Number(m[2])}秒` : ""}ごろ` : at;
+};
 
 /** 議論の流れ（話題ごとの時間の帯） */
 export function FlowTimeline({ flow, compact }: { flow: Flow | null; compact?: boolean }) {
@@ -39,7 +46,7 @@ export function FlowTimeline({ flow, compact }: { flow: Flow | null; compact?: b
         <h3 className={compact ? "t-sm" : "t-md"}>議論の流れ{flow ? `（${flow.totalMinutes}分）` : ""}</h3>
         {flow && <SourceTag source={flow.source} />}
       </div>
-      {!flow ? <p className="empty">{PENDING}</p> : (
+      {!flow ? <p className="empty">{PENDING}</p> : flow.speechDetected === false ? <p className="empty">{NO_SPEECH}</p> : (
         <>
           <div className={`timeline${compact ? "" : " timeline--tall"}`} role="img" aria-label={flow.segments.map((s) => `${s.topic} ${s.minutes}分`).join("、")}>
             {flow.segments.map((s, i) => (
@@ -57,11 +64,11 @@ export function FlowTimeline({ flow, compact }: { flow: Flow | null; compact?: b
 
 /** ここがよかった／ここを見直そう */
 export function GoodReview({ flow }: { flow: Flow | null }) {
-  if (!flow) {
+  if (!flow || flow.speechDetected === false) {
     return (
       <div className="row">
-        <section className="box box--md pad stack"><Tag tone="blue">ここがよかった</Tag><p className="empty">{PENDING}</p></section>
-        <section className="box box--md pad stack"><Tag tone="yellow">ここを見直そう</Tag><p className="empty">{PENDING}</p></section>
+        <section className="box box--md pad stack"><Tag tone="blue">ここがよかった</Tag><p className="empty">{flow ? NO_SPEECH : PENDING}</p></section>
+        <section className="box box--md pad stack"><Tag tone="yellow">ここを見直そう</Tag><p className="empty">{flow ? NO_SPEECH : PENDING}</p></section>
       </div>
     );
   }
@@ -71,7 +78,7 @@ export function GoodReview({ flow }: { flow: Flow | null }) {
         <div className="heading-row"><span><Tag tone="blue">ここがよかった</Tag></span><SourceTag source={flow.source} /></div>
         {flow.good.map((g, i) => (
           <div key={i} className="stack stack--tight">
-            <p className="t-small" style={{ fontWeight: 700 }}>{g.at}の発言</p>
+            <p className="t-small" style={{ fontWeight: 700 }}>{atLabel(g.at)}の発言</p>
             <p className="t-md">{g.text}</p>
           </div>
         ))}
@@ -80,7 +87,7 @@ export function GoodReview({ flow }: { flow: Flow | null }) {
         <div className="heading-row"><span><Tag tone="yellow">ここを見直そう</Tag></span><SourceTag source={flow.source} /></div>
         {flow.review.map((r, i) => (
           <div key={i} className="stack stack--tight">
-            <p className="t-small" style={{ fontWeight: 700 }}>{r.at}の場面</p>
+            <p className="t-small" style={{ fontWeight: 700 }}>{atLabel(r.at)}の場面</p>
             <p className="t-md">{r.text}</p>
             {r.question && <p className="box box--yellow" style={{ padding: "10px 14px" }}>{r.question}</p>}
           </div>
