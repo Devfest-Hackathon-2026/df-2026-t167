@@ -1,6 +1,8 @@
 # Google Discuss MVP：セッション内ロールと認証
 
-2026-11-06の変更指示を適用する。学校でのTeacher/Studentと議論のHost/Participantを分離し、MVPでは全員がGoogleでログインして `/home` を使う。教師claim、役割選択、Classroom接続を利用条件にしない。
+2026-11-06の変更指示を適用する。学校でのTeacher/Studentと議論のHost/Participantを分離し、MVPでは全員がGoogleでログインする。役割選択とClassroom接続は利用条件にしない。
+
+> 追記（Docs「サーバーフィードバック」）：ディスカッションを作れるのは、管理者が招待した教員（Google アカウントの teacher claim）だけにする。教員はログイン後に教員のホーム（`/teacher`）、それ以外の学生は参加コードの入力（`/join`）へ進む。作成後の Host/Participant は、これまでどおりセッションごとの members.role で決める。下の「教員の招待」を参照。
 
 ## ユーザー体験
 
@@ -147,3 +149,62 @@ GitHubのmain（017b78f）と公開済みPRを確認し、認証セッションP
 ブラウザ通し試験は、画面のファイル選択から2人の登録音声を送り、別録音を擬似マイクからAudioWorklet→API→実モデルへ流した。Host/Guestの実モデル表示、両者の発話時間、録音停止・端末保管、終了、ホームの終了表示まで検査する。共有端末の人数表示はアカウント数ではなく参加者名簿を数える。400msなどの短い発話時間は小数1桁の秒数で示す。
 
 専用試験では、直前のcheckでビルドしたNEXT_PUBLIC_FIREBASE_PROJECT_ID・エミュレータのポートに実行環境を合わせ、API_ORIGINも明示する（今回のオフセット30000ではhttp://127.0.0.1:38081）。Firestore/Authは専用エミュレータ、Gemini分析はモック、話者モデルと入力人声は実データ。クラウドpreviewは旧本番APIと共有するため、この通し結果とは分ける。
+
+## 教員の招待（作成の権限）
+
+- `POST /rooms` は、IDトークンの `teacher: true`（管理者が付けた custom claim）を確かめる。ない場合は `403 teacher_required`。本文の `teacher`・`role` は使わない。
+- 作成者はそのセッションの Host になる。Host 用の操作は members.role=host で判定し、teacher claim では判定しない。教員が他の教員のセッションに参加すれば、そこでは Participant になる。
+- 画面の振り分け（ログイン後の行き先、作成ボタンの表示）は IDトークンの claim を読むだけで、権限はAPIが確かめる。
+- 付与は管理者が `node scripts/teacher-access.mjs --project <プロジェクト> --email <メール> --action grant` で行う（`--uid` でもよい）。相手が一度 Google でログインしてから実行する。付与・解除のあとは以前のトークンを失効させるので、相手はログインし直す。メールアドレスと UID は出力しない。
+- 対象は、チームの教員3人と審査員用のテストアカウント（Docs「サーバーフィードバック」）。メールアドレスはリポジトリに書かない。
+
+### 本番で教師権限を付ける手順
+
+この手順は、本番の Firebase Authentication を変える。オーナーかプロジェクトの編集者が行う。メールアドレスは、ターミナルの引数以外（PR・Issue・チャット・ログ）に書かない。
+
+1. 対象の人に、本番の URL へ一度 Google でログインしてもらう。一度もログインしていないアカウントには付与できない。
+2. 実行する場所を選ぶ。
+   - 手元の PC（推奨。鍵を作らない）：編集者の Google アカウントで次を実行する。Node は 22.12 以上を使う。
+     ```bash
+     gcloud auth login
+     gcloud auth application-default login
+     gcloud auth application-default set-quota-project devfest2026-t167
+     npm --prefix api ci
+     ```
+   - クラウドの Claude Code：[認証情報の手順](credentials.md)の「AI 用の鍵を作る」で鍵を作り、環境変数 `GCP_SA_KEY` に登録して、新しいセッションを開く。起動時のフックが gcloud にログインする。
+3. 読み取りだけで状態を確かめる。`"googleLogin":true` で、`"disabled":false` なら付与できる。
+   ```bash
+   node scripts/teacher-access.mjs --project devfest2026-t167 --email <メールアドレス> --action inspect
+   ```
+4. 付与する。`{"teacher":true,"changed":true,"signInAgain":true}` が出れば成功。
+   ```bash
+   node scripts/teacher-access.mjs --project devfest2026-t167 --email <メールアドレス> --action grant
+   ```
+5. もう一度 `inspect` を実行し、`"teacher":true` になったことを確かめる。
+6. 本人にログインし直してもらい、教員のホーム（`/teacher`）に進んで「ディスカッションを作る」が出ることを確かめる。
+7. 外すときは `--action revoke` を同じように実行する。クラウド用の鍵は、提出のあと [認証情報の手順](credentials.md)の「抜けるとき・終わったとき」に従って消す。
+
+この PR を本番に反映する前に、対象の全員に付与を済ませる。済む前に反映すると、本番ではだれもディスカッションを作れなくなる。
+
+#### うまくいかないとき
+
+スクリプトは、メールアドレス・UID・鍵を出さないため、失敗しても「教師権限を確認・更新できませんでした」としか表示しない。次の順に確かめる。
+
+| 確かめること | 直し方 |
+|---|---|
+| 対象の人が本番に一度ログインしたか | 本番の URL で Google ログインしてもらう |
+| ADC にログインしているか | `gcloud auth application-default login` をやり直す |
+| 実行する人がプロジェクトの編集者以上か | オーナーのアカウントで実行する（Firebase Authentication の管理権限が要る） |
+| エミュレータの環境変数が残っていないか | `unset FIREBASE_AUTH_EMULATOR_HOST FIRESTORE_EMULATOR_HOST` |
+| Node が 22.12 以上か | `node --version` で確かめる |
+| `api/` の依存関係が入っているか | `npm --prefix api ci` |
+
+#### UID で付ける場合
+
+メールアドレスを使いたくないときは、[Firebase コンソールの Authentication](https://console.firebase.google.com/project/devfest2026-t167/authentication/users) で対象の人の「ユーザー UID」をコピーし、手順3〜5の `--email <メールアドレス>` を `--uid <UID>` に置き換える。`--uid` は main のスクリプトでも使える。
+
+#### 審査員用のテストアカウント
+
+1. 審査員用の Google アカウントを作り、本番に一度ログインする。
+2. 手順3〜5を同じように実行する。
+3. 受け渡し方（提出用の README に書くかどうか）はオーナーが決める。パスワードはリポジトリに書かない。
