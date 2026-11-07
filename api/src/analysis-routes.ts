@@ -30,10 +30,20 @@ export function registerAnalysisRoutes(app: Express, deps: Dependencies, guards:
       });
       throw new HttpError(503, 'gemini_unavailable', 'AI の提案は一時停止中です。議論はそのまま続けられます');
     }
+    // 分析のたびに提案が重なって増えないよう、同じトランザクションで
+    // ・すでに全員に表示した・見送った提案と同じ文は出し直さない
+    // ・まだ決めていない古い提案は、今回の結果に置き換える
+    // を行う。その間に承認・見送りが起きたら、トランザクションごとやり直して判定し直す。
     // 遅れて返った古い結果は捨てる（jobId が今の分析と一致するときだけ保存）
-    const saved = await finishAnalysis(roomId, 'analysis', jobId, (tx) => {
-      for (const p of points.filter((x) => !x.discussed)) {
-        tx.set(db.collection(`sessions/${roomId}/insights`).doc(), { summary: p.summary, status: 'pending', jobId, source: gemini.source, createdAt: FieldValue.serverTimestamp() });
+    const insightsRef = db.collection(`sessions/${roomId}/insights`);
+    let fresh: string[] = [];
+    const saved = await finishAnalysis(roomId, 'analysis', jobId, async (tx) => {
+      const existing = await tx.get(insightsRef);
+      const decided = new Set(existing.docs.filter((d) => d.get('status') !== 'pending').map((d) => d.get('summary') as string));
+      fresh = [...new Set(points.filter((x) => !x.discussed).map((x) => x.summary))].filter((s) => !decided.has(s));
+      for (const d of existing.docs) if (d.get('status') === 'pending') tx.delete(d.ref);
+      for (const summary of fresh) {
+        tx.set(insightsRef.doc(), { summary, status: 'pending', jobId, source: gemini.source, createdAt: FieldValue.serverTimestamp() });
       }
       tx.set(db.doc(`sessions/${roomId}/results/coverage`), {
         total: points.length, discussed: points.filter((x) => x.discussed).length,
@@ -42,7 +52,7 @@ export function registerAnalysisRoutes(app: Express, deps: Dependencies, guards:
       tx.update(roomRef(roomId), { 'analysis.status': 'done', 'analysis.finishedAt': FieldValue.serverTimestamp() });
     });
     if (!saved) throw new HttpError(409, 'stale_result', '新しい分析が始まったため、この結果は破棄しました');
-    res.json({ jobId, suggested: points.filter((x) => !x.discussed).length, total: points.length });
+    res.json({ jobId, suggested: fresh.length, total: points.length });
   })));
 
   // 提出状況（司会者）。非公開の事前意見と合意の一文は、本文を返さず件数だけを返す
@@ -74,6 +84,19 @@ export function registerAnalysisRoutes(app: Express, deps: Dependencies, guards:
       tx.update(ref, { status: 'approved', approvedAt: FieldValue.serverTimestamp() });
     });
     res.json({ status: 'approved' });
+  })));
+
+  // 提案を見送る（司会者）。見送った提案は参加者に届かず、同じ文は次の分析でも出し直さない
+  app.post('/rooms/:roomId/insights/:insightId/dismiss', ...chain(authenticate, member, moderator, wrap(async (req, res) => {
+    const ref = db.doc(`sessions/${req.params.roomId}/insights/${req.params.insightId}`);
+    await db.runTransaction(async (tx) => {
+      requireOpenRoom(await tx.get(roomRef(req.params.roomId)));
+      const s = await tx.get(ref);
+      if (!s.exists) throw new HttpError(404, 'insight_not_found', '提案がありません');
+      if (s.get('status') !== 'pending') throw new HttpError(409, 'already_decided', 'この提案は処理済みです');
+      tx.update(ref, { status: 'dismissed', dismissedAt: FieldValue.serverTimestamp() });
+    });
+    res.json({ status: 'dismissed' });
   })));
 
   // 合意の実態検証と4つの指標（司会者）
