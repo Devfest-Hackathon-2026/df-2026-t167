@@ -1,6 +1,8 @@
 "use client";
 import Link from "next/link";
+import { ArrowLeft } from "lucide-react";
 import { useHostUser, useIsTeacher } from "@/lib/hostAuth";
+import { useGeminiSource } from "@/components/ui";
 
 /**
  * 画面の骨組み（デザイン「黒板と付箋」）。上に1本の帯だけを置き、左のメニューは持たない（Docs「UIフィードバック」：
@@ -23,6 +25,8 @@ export function AppShell({ title, eyebrow, steps, status, actions, children, onL
   tone?: "paper" | "board";
 }) {
   const teacher = useIsTeacher();
+  // デモデータ（Gemini のモック）のときは、どの画面でも上の帯に1回だけ出す。各カードには出さない（ui.tsx の SourceTag）
+  const demo = useGeminiSource() === "mock";
   const home = teacher ? "/teacher" : "/home";
   const guard = (e: React.MouseEvent) => { if (onLeave && !onLeave()) e.preventDefault(); };
 
@@ -30,7 +34,7 @@ export function AppShell({ title, eyebrow, steps, status, actions, children, onL
     <div className="shell" data-tone={tone} data-wide={wide || undefined}>
       <header className="shell__bar">
         {nav && back
-          ? <Link href={back} className="shell__back" aria-label="ホーム" onClick={guard}><BackIcon /></Link>
+          ? <Link href={back} className="shell__back" aria-label="ホーム" onClick={guard}><ArrowLeft size={22} strokeWidth={1.75} aria-hidden="true" /></Link>
           : nav ? <Link href={home} className="shell__brand" onClick={guard}>Discuss</Link>
             : <span className="shell__brand">Discuss</span>}
         <div className="shell__title">
@@ -39,6 +43,7 @@ export function AppShell({ title, eyebrow, steps, status, actions, children, onL
         </div>
         {steps && <div className="shell__steps">{steps}</div>}
         {status ? <span className="sr-only" data-testid="phase">{status}</span> : null}
+        {demo && <span className="tag tag--yellow shell__demo">デモデータ</span>}
         {actions && <div className="shell__actions">{actions}</div>}
         {nav && <Account onClick={guard} />}
       </header>
@@ -80,13 +85,5 @@ export function Stepper({ steps, current }: { steps: string[]; current: number }
         {steps.map((label, i) => <span key={label} data-state={i < current ? "done" : i === current ? "now" : undefined} />)}
       </div>
     </div>
-  );
-}
-
-function BackIcon() {
-  return (
-    <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
-      <path d="m7.8 13 5.6 5.6L12 20l-8-8 8-8 1.4 1.4L7.8 11H20v2H7.8Z" />
-    </svg>
   );
 }
