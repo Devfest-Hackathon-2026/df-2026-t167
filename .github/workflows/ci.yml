@@ -1,0 +1,68 @@
+name: ci
+on:
+  pull_request:
+  workflow_call:
+# PR は同じブランチの新しい実行が古い実行を取り消す。main（deploy から呼ばれる）は取り消さない
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      # 文書だけの PR では test を飛ばす。飛ばしたジョブは必須チェックでは成功として扱われる
+      - id: classify
+        run: bash scripts/ci-changes.sh ${{ github.event_name == 'pull_request' && format('{0} {1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || '' }}
+  test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: "**/package-lock.json"
+      - uses: actions/setup-java@v4   # Firestore エミュレータに必要
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: bash scripts/dev.sh setup
+      - name: Install Playwright browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      # 手元の bash scripts/dev.sh check とまったく同じ検査
+      - run: bash scripts/dev.sh check
+      # 検査を通った中身（PR を main に重ねたツリー）を、名前に入れた成果物で記録する。
+      # deploy は、main に入った中身のツリーが同じなら検査をやり直さない（docs/infra-manual.md「CI とデプロイ」）
+      - name: Record the tested tree
+        if: github.event_name == 'pull_request'
+        run: |
+          TREE=$(git rev-parse 'HEAD^{tree}')
+          echo "$TREE" > tested-tree.txt
+          echo "TESTED_TREE=${TREE}" >> "$GITHUB_ENV"
+      # upload-artifact は「.」で始まるファイルを既定で除外するので、ふつうの名前のファイルを置く。
+      # 記録が残らないまま成功しないよう、ファイルがなければ失敗にする
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-tree-${{ env.TESTED_TREE }}
+          path: tested-tree.txt
+          if-no-files-found: error
+          overwrite: true   # CI をやり直したとき、同じ名前の記録とぶつかって失敗しない
+          retention-days: 30
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report
+          retention-days: 7

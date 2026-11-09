@@ -3,32 +3,26 @@
 .env.*
 !.env.example
 .dev.vars
-.dev.vars.*
-!.dev.vars.example
 *.pem
-*.key
 *.p12
-service-account*.json
-credentials*.json
-google-services.json
-GoogleService-Info.plist
-
-# 依存関係とビルドの成果物
-node_modules/
+*-key.json
+# google-github-actions/auth が生成する一時認証ファイル
+gha-creds-*.json
+# 依存関係・生成物
+node_modules
 dist/
-build/
-out/
 .next/
-.wrangler/
-__pycache__/
-*.pyc
-.venv/
-venv/
+web/test-results/
+web/playwright-report/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.firebase/
 
-# OS とエディタ
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/*
-!.vscode/extensions.json
-*.log
+# Local quality reports
+api/coverage/
+.local-data/
+__pycache__/
+
+# deploy がいまの API のイメージから取り出す話者推定のモデルの控え
+speech/models-cache/

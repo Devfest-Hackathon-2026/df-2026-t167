@@ -1,0 +1,36 @@
+{
+  "//": "画面はブラウザから 127.0.0.1 のエミュレータ（8080・9099）に直接つなぐ。Codespaces はブラウザ版ではなく VS Code（デスクトップ）から開き、ポートを localhost に転送させる",
+  "name": "t167",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:1-22-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "21"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "postCreateCommand": "bash scripts/dev.sh setup && cd web && npx playwright install --with-deps chromium",
+  "forwardPorts": [
+    3000,
+    4000,
+    8080,
+    8081,
+    9099
+  ],
+  "portsAttributes": {
+    "3000": {
+      "label": "画面"
+    },
+    "4000": {
+      "label": "エミュレータの画面"
+    },
+    "8081": {
+      "label": "API"
+    },
+    "8080": {
+      "label": "Firestore エミュレータ"
+    },
+    "9099": {
+      "label": "Auth エミュレータ"
+    }
+  }
+}

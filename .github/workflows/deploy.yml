@@ -1,0 +1,183 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+    # 文書だけの push では本番を入れ替えない（scripts/ci-changes.sh の「文書だけ」と同じ条件。tests/config.test.sh が一致を確かめる）
+    paths-ignore: ["**/*.md", "docs/**", "LICENSE"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "再デプロイするコミット（ロールバック用。このブランチの過去のコミット）"
+        required: true
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+  actions: read   # ロールバック先が過去にデプロイに成功したかを確かめる
+jobs:
+  # main に入った中身（ツリー）が、PR の CI で検査を通った中身と同じかを確かめる。
+  # 同じなら検査をやり直さない。PR のあとに main が進んで中身が変わったときだけ、ここで検査する
+  tested:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ok: ${{ steps.find.outputs.ok }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_ID: ${{ github.repository_id }}
+        # API が失敗しても、このジョブは失敗にせず「記録なし」として扱う（実行が失敗になると、そのコミットにロールバックできなくなる）
+        run: |
+          OK=false
+          TREE=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${GITHUB_SHA}" --jq .tree.sha) || TREE=""
+          if [ -n "$TREE" ]; then
+            # 期限内で、このリポジトリのブランチから記録を残した実行（フォークの PR の記録は使わない）
+            RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=tested-tree-${TREE}&per_page=100" \
+              --jq "[.artifacts[] | select(.expired | not) | select(.workflow_run.head_repository_id == ${REPO_ID})] | .[].workflow_run.id") || RUNS=""
+            for RUN in $RUNS; do
+              # PR の CI（ci.yml・pull_request）で成功した実行の記録だけを使う。ほかのワークフローが作った同じ名前の記録は使わない
+              R=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN}" --jq '[.path, .event, .conclusion] | join(" ")') || continue
+              if [ "$R" = ".github/workflows/ci.yml pull_request success" ]; then OK=true; break; fi
+            done
+          fi
+          echo "ok=${OK}" >> "$GITHUB_OUTPUT"
+          if [ "$OK" = true ]; then
+            echo "| 検査 | ツリー ${TREE} は PR の CI で検査を通った中身と同じ。やり直さない |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 検査 | ツリー ${TREE:-（取得できず）} は検査を通った記録がない（PR のあとに main が進んだか、確かめられない）。やり直す |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+  ci:
+    needs: tested
+    # 記録を確かめられなかったとき（API の失敗を含む）も検査する。run を取り消したときは動かない
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.tested.outputs.ok != 'true' }}
+    uses: ./.github/workflows/ci.yml
+  deploy:
+    needs: [tested, ci]
+    # push は、検査を通った中身と同じか、ここでの CI を通ったときだけ。手動の再デプロイ（ロールバック）は、過去に CI を通ったコミットを使う
+    # run を取り消したときは動かない（always() は取り消しのときも真になるため、!cancelled() を使う）
+    if: >-
+      !cancelled() && (
+        needs.ci.result == 'success' ||
+        (github.event_name == 'push' && needs.tested.outputs.ok == 'true' && needs.ci.result == 'skipped') ||
+        (github.event_name == 'workflow_dispatch' && needs.ci.result == 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PROJECT_ID: ${{ vars.PROJECT_ID }}
+      WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
+      DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
+      REGION: ${{ vars.REGION }}
+      VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      # 任意の Variables: API_MIN_INSTANCES
+      # API の最小インスタンス数（未登録なら 0）。デモ・審査の前に 1 にすると、その後のデプロイでも 1 が保たれる
+      API_MIN_INSTANCES: ${{ vars.API_MIN_INSTANCES || '0' }}
+      DEPLOY_REF: ${{ inputs.ref || github.sha }}
+    steps:
+      # 1つでも空なら、認証やビルドの前に止める。空のまま Cloud Run に渡すと、デプロイは成功しても Gemini が動かないため
+      # 一覧は infra/setup-deployer.sh の表示と同じ（tests/config.test.sh が一致を確かめる）
+      - name: Check repository Variables
+        run: |
+          missing=""
+          for v in PROJECT_ID REGION VERTEX_LOCATION GEMINI_MODEL WIF_PROVIDER DEPLOYER_SA; do
+            [ -n "$(printf '%s' "${!v}" | tr -d '[:space:]')" ] || missing="${missing} ${v}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::GitHub の Variables が未登録です:${missing}。infra/setup-deployer.sh の表示どおりに Settings → Secrets and variables → Actions → Variables に登録してください"
+            exit 1
+          fi
+          case "$API_MIN_INSTANCES" in
+            0|1|2) ;;
+            *) echo "::error::API_MIN_INSTANCES は 0〜2 の整数にしてください（最大インスタンス数が 2 のため）: ${API_MIN_INSTANCES}"; exit 1 ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_REF }}
+          fetch-depth: 0
+      - name: The commit must belong to this branch
+        run: git merge-base --is-ancestor "$(git rev-parse HEAD)" "origin/${GITHUB_REF_NAME}"
+      - name: Roll back only to a commit that deployed successfully before
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          N=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy.yml --commit "$SHA" --status success --json databaseId --jq length)
+          [ "$N" -gt 0 ] || { echo "::error::${SHA} は過去にデプロイが成功していません。成功したコミットは Actions の deploy の一覧で確かめてください"; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: firebase/package-lock.json
+      - run: npm ci --prefix firebase
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: 1/3 Firestore and Storage rules, indexes
+        run: node infra/deploy-rules.mjs --apply
+      - name: 2/3 API (Cloud Run)
+        run: |
+          SHA=$(git rev-parse HEAD)
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/app/api:${SHA}"
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          # 話者推定のモデルを、いま動いている API のイメージから控え（speech/models-cache）に取り出す。
+          # 外部の取得先（GitHub のリリース）の障害でデプロイを止めないため。取り出せなければ、ビルドの中で取得先から取る
+          mkdir -p speech/models-cache
+          # 取り出せないときは、理由を警告に出して取得先から取る（このステップは止めない）
+          CURRENT=$(gcloud run services describe api --project "$PROJECT_ID" --region "$REGION" --format='value(spec.template.spec.containers[0].image)' 2>describe.err) || CURRENT=""
+          if [ -z "$CURRENT" ]; then
+            echo "::warning::いまの API のイメージがわからない（$(tr '\n' ' ' < describe.err)）。モデルは取得先から取る"
+          elif ! docker pull -q "$CURRENT" >/dev/null 2>pull.err; then
+            echo "::warning::${CURRENT} を取得できなかった（$(tr '\n' ' ' < pull.err)）。モデルは取得先から取る"
+          elif CID=$(docker create "$CURRENT"); then
+            docker cp "${CID}:/app/.local-data/speaker-models/." speech/models-cache/ || echo "::warning::${CURRENT} からモデルを取り出せなかった。取得先から取る"
+            docker rm "$CID" >/dev/null || true
+          else
+            echo "::warning::${CURRENT} からコンテナを作れなかった。モデルは取得先から取る"
+          fi
+          rm -f describe.err pull.err
+          ls -l speech/models-cache
+          docker build -f api/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          gcloud run deploy api --project "$PROJECT_ID" --region "$REGION" --image "$IMAGE" \
+            --service-account "api-runtime@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --allow-unauthenticated --labels "commit=${SHA:0:12}" \
+            --cpu 2 --memory 2Gi --concurrency 8 --min-instances "$API_MIN_INSTANCES" --max-instances 2 \
+            --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},VERTEX_LOCATION=${VERTEX_LOCATION},GEMINI_MODEL=${GEMINI_MODEL},GEMINI_MOCK=0"
+      - name: 3/3 Web (App Hosting)
+        run: firebase/node_modules/.bin/firebase deploy --only apphosting:web --project "$PROJECT_ID" --non-interactive
+      - name: Record what is deployed
+        run: |
+          REV=$(gcloud run services describe api --project "$PROJECT_ID" --region "$REGION" --format='value(status.latestReadyRevisionName)')
+          {
+            echo "### Deployed to ${PROJECT_ID}"
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            echo "| コミット | $(git rev-parse HEAD) |"
+            echo "| API リビジョン | ${REV} |"
+            echo "| API の最小インスタンス数 | ${API_MIN_INSTANCES} |"
+            echo "| Firestore/Storage Rules・Web | 同じコミットから反映 |"
+            echo "| 実行者 | ${GITHUB_ACTOR}（${GITHUB_EVENT_NAME}） |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # 画面 → /api の転送 → API → Gemini の設定 をまとめて確かめる。生成が成功するかは表さない（docs/production-check.md）
+      - name: Check the production URL
+        run: |
+          APPHOSTING_REGION=$(source infra/env.sh && echo "$APPHOSTING_REGION")
+          URL="https://web--${PROJECT_ID}.${APPHOSTING_REGION}.hosted.app/api/healthz"
+          for i in $(seq 1 12); do
+            BODY=$(curl -fsS --max-time 20 "$URL" 2>/dev/null || true)
+            case "$BODY" in
+              *'"ok":true'*'"gemini":"gemini"'*)
+                echo "| 稼働確認 | ${URL} が ${BODY} を返した |" >> "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::${URL} が {\"ok\":true,\"gemini\":\"gemini\"} を返しません（最後の応答: ${BODY:-なし}）。Actions の deploy の各手順と Cloud Run のログを確かめ、必要ならロールバックしてください"
+          exit 1
