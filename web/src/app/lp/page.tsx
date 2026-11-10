@@ -10,6 +10,7 @@ import "./lp.css";
  * 自分の考えを見直す力（論理的思考とメタ認知）。Topos は、グループディスカッションをその力を育てる場にする。
  * 3機能（AGENTS.md・README）：発言率の可視化、音声認識による未検討の論点の可視化、事前の意見から結論への主張の変化の確認。
  * 行動は「ログイン」（学生・招待済みの教員）と「利用を申し込む」（これから使う教員・学校。メール）。
+ * 8グループの場面・学習指導要領・よくある質問は、こゆりの LP 案（Figma「v8 Topos」、PR #89）から引き継いだ。
  */
 
 const LEAD = "グループディスカッションで埋もれた考えを AI が見つけ、全員の考えが活かされる議論にする。";
@@ -30,6 +31,42 @@ const GAPS = [
   { title: "自分の関わり方を、振り返れない", body: "どの場面で話し、どこで黙ったのか。材料がないから、次の議論も同じように過ぎていく。" },
   { title: "教員に届くのは、結論だけ", body: "どのグループで、誰の考えが失われたのか。過程が見えないまま、授業が終わる。" },
 ];
+
+/**
+ * 8グループの節。40人のクラスなら8つの議論が同時に進み、教員がその場で聞けるのは1つだけ。
+ * 聞けなかった7つで何が起きていたかを、Topos の分析結果（3機能）として具体的に示す。テーマは FEATURES と同じ架空の例。
+ */
+const ROOMS: { n: number; kind?: "points" | "rate" | "change"; label?: string; body: string }[] = [
+  { n: 1, body: "教員がその場で聞いていたグループ" },
+  { n: 2, kind: "points", label: "未検討の論点", body: "有料の AI を使える人と、使えない人で差が出る" },
+  { n: 3, kind: "rate", label: "発言率", body: "理由の深掘りの場面で、4人中2人が一度も話さなかった" },
+  { n: 4, kind: "change", label: "考えの変化", body: "「禁止すべき」から「申告すれば下調べに使える」へ、3人が考えを変えた" },
+  { n: 5, kind: "points", label: "未検討の論点", body: "使ったことを、どこまで申告するか" },
+  { n: 6, kind: "change", label: "結論の理解", body: "全員が「賛成」。ただし、認める範囲は2通りに分かれた" },
+  { n: 7, kind: "rate", label: "発言率", body: "まとめの場面で、発言が1人に集中した" },
+  { n: 8, kind: "points", label: "未検討の論点", body: "AI の答えが誤っていたとき、誰が責任を持つか" },
+];
+
+/** 次期学習指導要領に向けて示された3つの方向性と、Topos の役割 */
+const GUIDELINE = [
+  { en: "Excellence", ja: "「主体的・対話的で深い学び」の実装", feature: "事前の意見から結論への主張の変化の確認" },
+  { en: "Equity", ja: "多様性の包摂", feature: "音声認識による未検討の論点の可視化" },
+  { en: "Feasibility", ja: "実現可能性の確保", feature: "発言率の可視化と、全グループの結果の確認" },
+];
+
+/** よくある質問（主な読み手は、利用を考えている教員） */
+const FAQ = [
+  { q: "どんな授業で使えますか？", a: "テーマは教員が入力するので、教科を問わず、グループで話し合う授業に使えます。" },
+  { q: "どんな端末で使えますか？録音はどうしますか？", a: "学生はスマホやタブレットのブラウザから参加できます。インストールは不要です。録音はグループで1台、グループ全員の同意を確かめてから始めます。発言率を出すため、はじめに一人ずつ声を約10秒登録します。" },
+  { q: "事前に書いた意見は、ほかの人に見られますか？", a: "事前の意見の本文は、書いた本人にしか表示されません。教員やほかの学生に示すのは、AI が個人を特定しない表現に言い換えた論点だけです。" },
+];
+
+/** 開発者。ヘッダーの吹き出しから、ポートフォリオへ進む */
+const DEVELOPERS = [
+  { name: "Yuto Matsui", role: "Project Manager & Research Engineer", url: "https://yuto-matsui.com/" },
+  { name: "Koyuri Yamashita", role: "Designer", url: "https://student.redesigner.jp/students/084beef656c4ad6644e4208ab028fd58" },
+  { name: "Ryota Murakami", role: "Engineer" },
+] as const;
 
 /** 3機能。それぞれが、学生のどの力を支えるか */
 const FEATURES = [
@@ -93,9 +130,21 @@ export default function LandingPage() {
         <div className="lp-nav__in">
           <Link href="/lp" className="lp-nav__brand"><span className="lp-nav__mark" aria-hidden="true" />Topos</Link>
           <nav className="lp-nav__end" aria-label="LP">
+            <button type="button" className="lp-nav__link lp-nav__dev" popoverTarget="lp-devs">About the Developers</button>
             <a href={APPLY} className="lp-nav__link">利用を申し込む</a>
             <Link href="/" className="lp-btn lp-btn--sm">ログイン</Link>
           </nav>
+        </div>
+        <div id="lp-devs" popover="auto" className="devpop" aria-label="About the Developers">
+          <ul>
+            {DEVELOPERS.map((d) => (
+              <li key={d.name}>
+                {"url" in d
+                  ? <a href={d.url} target="_blank" rel="noopener noreferrer"><b>{d.name}</b><span>{d.role}</span><i aria-hidden="true">↗</i></a>
+                  : <div><b>{d.name}</b><span>{d.role}</span></div>}
+              </li>
+            ))}
+          </ul>
         </div>
       </header>
 
@@ -152,6 +201,25 @@ export default function LandingPage() {
           </div>
         </section>
 
+        {/* 3b. 8グループ：その場で聞けなかった7つの議論で起きていたことを、授業のあとに示す */}
+        <section className="sec sec--dark" id="rooms" aria-labelledby="lp-rooms-title">
+          <div className="wrap">
+            <header className="sec__head" data-reveal>
+              <h2 id="lp-rooms-title" className="h2">教員がその場で聞けるのは、<br />8つの議論のうち1つ。</h2>
+              <p className="sec__lead sec__lead--dark">40人の教室では、8つのグループが同時に話し合う。聞けなかった7つで何が起きていたかを、Topos は授業のあとに示す。</p>
+            </header>
+            <ol className="rooms">
+              {ROOMS.map((r) => (
+                <li key={r.n} className={`room${r.kind ? ` room--${r.kind}` : " room--here"}`} data-reveal>
+                  <p className="room__name">グループ{r.n}</p>
+                  {r.label && <p className="room__label">{r.label}</p>}
+                  <p className="room__body">{r.body}</p>
+                </li>
+              ))}
+            </ol>
+          </div>
+        </section>
+
         {/* 4. 3機能：埋もれた考えを、学びの材料に変える */}
         <section className="sec sec--white" id="features" aria-labelledby="lp-feat-title">
           <div className="wrap">
@@ -189,6 +257,26 @@ export default function LandingPage() {
           </div>
         </section>
 
+        {/* 5b. 学習指導要領：これからの授業が求めることと、重なる */}
+        <section className="sec sec--white" id="guideline" aria-labelledby="lp-cg-title">
+          <div className="wrap">
+            <header className="sec__head" data-reveal>
+              <h2 id="lp-cg-title" className="h2">これからの授業が求めることと、重なる。</h2>
+              <p className="sec__lead">次期学習指導要領に向けて示された3つの方向性と、それを支える Topos の機能。</p>
+            </header>
+            <ol className="cg">
+              {GUIDELINE.map((g) => (
+                <li key={g.en} className="cg__item" data-reveal>
+                  <p className="cg__en" lang="en">{g.en}</p>
+                  <h3 className="cg__ja">{g.ja}</h3>
+                  <p className="cg__feature"><span>Topos の機能</span>{g.feature}</p>
+                </li>
+              ))}
+            </ol>
+            <p className="cg__src">出典：中央教育審議会 初等中等教育分科会 教育課程部会「次期学習指導要領等に向けた審議まとめ」（2026年10月5日）。Topos は文部科学省の認定等を受けたものではありません。</p>
+          </div>
+        </section>
+
         {/* 6. 始め方 */}
         <section className="sec sec--gray" aria-labelledby="lp-start-title">
           <div className="wrap">
@@ -215,6 +303,23 @@ export default function LandingPage() {
                 <a href={APPLY} className="lp-btn lp-btn--light start__cta">メールで申し込む</a>
                 <p className="start__mail">{CONTACT}</p>
               </article>
+            </div>
+          </div>
+        </section>
+
+        {/* 6b. よくある質問 */}
+        <section className="sec sec--white" id="faq" aria-labelledby="lp-faq-title">
+          <div className="wrap qa-wrap">
+            <header className="sec__head" data-reveal>
+              <h2 id="lp-faq-title" className="h2">よくある質問</h2>
+            </header>
+            <div className="qa" data-reveal>
+              {FAQ.map((f) => (
+                <details key={f.q} className="qa__item">
+                  <summary className="qa__q">{f.q}</summary>
+                  <p className="qa__a">{f.a}</p>
+                </details>
+              ))}
             </div>
           </div>
         </section>
