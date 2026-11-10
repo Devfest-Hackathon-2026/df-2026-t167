@@ -1,23 +1,28 @@
 "use client";
 import { useEffect, useState } from "react";
-import { HostSpeaking, type SpeakingState } from "@/components/Speaking";
+import { type SpeakingState } from "@/components/Speaking";
 import { SourceTag } from "@/components/ui";
 import { ApiError, callApi } from "@/lib/api";
-import { millis, useDoc, useGroups, useMessages, type Coverage, type Insight, type Member, type Room } from "@/lib/room";
+import { millis, useDoc, useGroups, useMessages, type Coverage, type GroupResult, type Insight, type LiveGroupOverview, type Member, type Room } from "@/lib/room";
+import { formatClock, useDiscussionClock } from "@/components/DiscussionClock";
+import { GroupCards } from "./GroupCards";
 import { useRoomFeed } from "@/lib/room-stream";
 
 /** API は分析中の記録を60秒で期限切れにする。画面も同じ期限でボタンを戻す */
 const ANALYSIS_LOCK_MS = 60_000;
+/** 提案の種類：事前の意見にあったのに話されていない論点か、Gemini が共有メモから出した新しい切り口か */
+const kindLabel = (i: Insight) => (i.kind === "new_angle" ? "新しい切り口（AIの提案）" : "まだ議論されていない論点");
 /** 新しいメモが届いたら、前の分析から60秒あけて自動で探す（Gemini の呼び出しは1部屋で1分に1回まで） */
 const AUTO_GAP_MS = 60_000;
 
 /**
- * 議論中の教員の画面（教室に投影する黒板）。司会者が「次に何をすべきか」を一目で決められるように、
- * 上の帯に経過時間と3つの数字（意見の検討率・未検討の論点・発言した人）、
- * 主役に AI が見つけた「まだ話されていない論点」の付箋（全員に表示する／見送る）を置く（Docs「アプリの構想」§3）。
+ * 議論中の教員の画面（Figma「最新」ダッシュボード（進行）182:445）。司会者が「次に何をすべきか」を一目で決められるように、
+ * 上の青い帯に時間・授業の進み具合・未検討の論点・終える、その下にグループのカードを置く。
+ * AI が見つけた「まだ話されていない論点」（中核の機能。Docs「アプリの構想」§3）が届いたら、グループのカードより上に出す。
  * 事前意見の本文は出さない（提案は Gemini が言い換えた論点だけ）。
+ * 1本化した流れでは、議論は教員が一斉に終えるので、議論中のグループは「事前の意見」か「話し合い中」のどちらか。
  */
-export function LiveBoard({ roomId, room, members, insights }: { roomId: string; room: Room; members: Member[]; insights: Insight[] }) {
+export function LiveBoard({ roomId, room, members, insights, results = [] }: { roomId: string; room: Room; members: Member[]; insights: Insight[]; results?: GroupResult[] }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
   const coverage = useDoc<Coverage>(`sessions/${roomId}/results/coverage`).data;
@@ -25,15 +30,11 @@ export function LiveBoard({ roomId, room, members, insights }: { roomId: string;
   const speaking = (useRoomFeed(roomId).collections[`sessions/${roomId}/speaking`] ?? []) as unknown as SpeakingState[];
   const groupConfigs = useGroups(roomId);
   const pending = insights.filter((i) => i.status === "pending");
+  const groupNumbers = Array.from({ length: room.groups ?? 1 }, (_, i) => i + 1);
   const approved = insights.filter((i) => i.status === "approved");
 
-  const started = millis(room.startedAt);
-  const elapsed = started ? Math.max(0, Math.floor((now - started) / 1000)) : 0;
+  const clock = useDiscussionClock(room);
   const scan = useScan(roomId, room, messages.map((m) => millis(m.createdAt) ?? 0), now);
-  const voice = speaking.flatMap((s) => s.members ?? []);
-  const spoke = voice.length
-    ? { label: "話した人", count: speaking.reduce((n, s) => n + (s.members ?? []).filter((m) => (s.talkMs?.[m.uid] ?? 0) > 0).length, 0), total: voice.length }
-    : { label: "メモを書いた人", count: new Set(messages.map((m) => m.uid).filter((uid) => members.some((p) => p.id === uid))).size, total: members.length };
 
   const [busyId, setBusyId] = useState<string>(), [error, setError] = useState("");
   async function decide(id: string, action: "approve" | "dismiss") {
@@ -43,6 +44,10 @@ export function LiveBoard({ roomId, room, members, insights }: { roomId: string;
     finally { setBusyId(undefined); }
   }
 
+  // 未検討の論点が届いたら、論点を先に、グループのカードを後に並べる
+  // 共有メモから Gemini がまとめた、グループごとの議論の軸（先生だけが読める）。未検討の論点の分析と同じ呼び出しで更新する
+  const overview = useDoc<LiveGroupOverview>(`sessions/${roomId}/results/live-groups`).data;
+  const cards = <GroupCards roomId={roomId} room={room} groups={groupNumbers} results={results} speaking={speaking} configs={groupConfigs} now={now} overview={overview?.groups} />;
   // 段階ごとに「今やること」を1つだけ大きく見せる。提案があれば、次に投げかける1つを主役に、残りは下に小さく並べる
   const [focus, ...rest] = pending;
   const headline = focus ? "この論点を投げかけましょう"
@@ -65,25 +70,22 @@ export function LiveBoard({ roomId, room, members, insights }: { roomId: string;
 
   return (
     <div className="teacher__body live">
-      <section className="tally" aria-label="議論の進み具合">
-        <p className="tally__time" role="timer" aria-label="経過時間">{String(Math.floor(elapsed / 60)).padStart(2, "0")}:{String(elapsed % 60).padStart(2, "0")}</p>
-        <dl className="tally__list">
-          <div>
-            <dt>意見の検討率</dt>
-            <dd className="tally__num">{coverage?.reflectionRate == null ? "—" : `${Math.round(coverage.reflectionRate * 100)}%`}</dd>
-            {coverage && <dd className="tally__sub">話された論点 {coverage.discussed}/{coverage.total}</dd>}
-          </div>
-          <div data-alert={pending.length > 0 || undefined}>
-            <dt>未検討の論点</dt>
-            <dd className="tally__num">{pending.length}</dd>
-          </div>
-          <div>
-            <dt>{spoke.label}</dt>
-            <dd className="tally__num">{spoke.count}<small>/{spoke.total}人</small></dd>
-          </div>
-        </dl>
+      {/* Figma「最新」ダッシュボード（進行）182:445：上の青い帯に、経過時間・授業の進み具合・未検討の論点・終える */}
+      <section className="tally tally--blue" aria-label="議論の進み具合">
+        <div className="tally__clock"><p className="tally__label">{clock?.label ?? "経過時間"}</p><p className="tally__time" role="timer" aria-label={clock?.label ?? "経過時間"}>{formatClock(clock?.seconds ?? 0)}</p></div>
+        <div className="tally__progress">
+          <p className="tally__label">授業の進み具合・参加 {members.length}人</p>
+          <p className="tally__headline">結果が出たグループ {groupNumbers.filter((g) => room.groupState?.[String(g)]?.status === "done").length}/{groupNumbers.length}</p>
+        </div>
+        {/* 数字を押すと、論点の欄へ移る（グループが多いときも、中核の機能にすぐ届くように） */}
+        <a className="tally__alert" href="#next-title" data-alert={pending.length > 0 || undefined} aria-label={`未検討の論点 ${pending.length}件。論点の欄へ移る`}>
+          <p className="tally__label">未検討の論点</p>
+          <p className="tally__num">{pending.length}{coverage && <small>話された {coverage.discussed}/{coverage.total}</small>}</p>
+        </a>
         <FinishButton roomId={roomId} />
       </section>
+
+      {pending.length === 0 && cards}
 
       <div className="live-grid">
         <section className="next" aria-labelledby="next-title">
@@ -92,7 +94,7 @@ export function LiveBoard({ roomId, room, members, insights }: { roomId: string;
           {error && <p className="notice notice--error" role="alert">{error}</p>}
           {focus ? (
             <article className="box--yellow proposal proposal--focus" aria-label="次に投げかける論点">
-              <div className="proposal__head"><p className="t-label">まだ議論されていない論点</p><SourceTag source={focus.source} /></div>
+              <div className="proposal__head"><p className="t-label">{kindLabel(focus)}</p><SourceTag source={focus.source} /></div>
               <p className="t-md proposal__text">{focus.summary}</p>
               {actions(focus)}
             </article>
@@ -108,7 +110,7 @@ export function LiveBoard({ roomId, room, members, insights }: { roomId: string;
               <ul className="queue__list">
                 {rest.map((i) => (
                   <li key={i.id} className="box--yellow proposal proposal--queued">
-                    <p className="t-label sr-only">まだ議論されていない論点</p>
+                    <p className="t-label proposal__kind">{kindLabel(i)}</p>
                     <p className="t-md proposal__text">{i.summary}</p>
                     {actions(i, false)}
                   </li>
@@ -143,18 +145,9 @@ export function LiveBoard({ roomId, room, members, insights }: { roomId: string;
             </section>
           )}
           {room.joinCode && <p className="live-side__code">途中から参加するときの参加コード<strong aria-label={room.joinCode.split("").join(" ")}>{room.joinCode.slice(0, 3)} {room.joinCode.slice(3)}</strong></p>}
-          <section aria-labelledby="groups-title">
-            <h2 id="groups-title" className="live-side__title">グループ</h2>
-            <ul className="group-list">
-              {Array.from({ length: room.groups ?? 1 }, (_, i) => i + 1).map((g) => {
-                const st = room.groupState?.[String(g)], recorder = groupConfigs.find((c) => c.number === g)?.recorderName;
-                return <li key={g}><span>グループ{g}</span><span className="t-note">{st?.total ?? 0}人{recorder && room.recording !== false ? `・録音：${recorder}さん` : ""}{st?.recording?.status ? `・録音の分析：${{ analyzing: "分析中", done: "完了", failed: "失敗" }[st.recording.status]}` : ""}</span></li>;
-              })}
-            </ul>
-          </section>
-          <HostSpeaking roomId={roomId} card />
         </aside>
       </div>
+      {pending.length > 0 && cards}
     </div>
   );
 }

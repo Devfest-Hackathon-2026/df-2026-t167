@@ -4,8 +4,9 @@ import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { HttpError, wrap, requireOpenRoom, type Handler } from './http.js';
 import { createAnalysisJobs } from './analysis-jobs.js';
 import { validateComparison } from './gemini.js';
+import { validateLiveOverview, type LiveOverview } from './live-overview.js';
 import { groupNumber, messageCounts } from './policy.js';
-import { alignmentRate, interventionEffectiveness, participationFairness, reflectionRate } from './metrics.js';
+import { agreementSummary, alignmentRate, interventionEffectiveness, participationFairness, reflectionRate } from './metrics.js';
 import type { Dependencies } from './dependencies.js';
 export function registerAnalysisRoutes(app: Express, deps: Dependencies, guards: { authenticate: Handler; member: Handler; moderator: Handler }) {
   const { db, gemini } = deps;
@@ -17,13 +18,24 @@ export function registerAnalysisRoutes(app: Express, deps: Dependencies, guards:
   app.post('/rooms/:roomId/analyze', ...chain(authenticate, member, moderator, wrap(async (req, res) => {
     const roomId = req.params.roomId;
     const { jobId } = await beginAnalysis(roomId, 'analysis');
-    const [ops, msgs] = await Promise.all([
+    const [ops, msgs, room, members] = await Promise.all([
       db.collection(`sessions/${roomId}/privateOpinions`).get(),
       db.collection(`sessions/${roomId}/messages`).orderBy('createdAt').get(),
+      roomRef(roomId).get(),
+      db.collection(`sessions/${roomId}/members`).where('role', '==', 'participant').get(),
     ]);
+    const groupOf = new Map(members.docs.filter(m => m.get('status') !== 'inactive').map(m => [m.id, groupNumber(m, room.get('groups'))]));
+    const groups = Array.from({ length: room.get('groups') ?? 1 }, (_, i) => ({ group: i + 1, messages: msgs.docs.filter(d => groupOf.get(d.get('uid')) === i + 1).slice(-20).map(d => String(d.get('text')).slice(0, 500)) })).filter(g => g.messages.length);
     let points;
+    let overview: LiveOverview = { groups: [], suggestions: [] }, overviewFailed = false;
+    // グループの軸（補助）は、未検討の論点（中核）と並べて呼ぶ。補助が失敗・不正な応答でも、中核の結果は捨てない
+    const overviewJob = groups.length
+      ? trackJob(deps, 'group', jobId, async () => validateLiveOverview(await gemini.summarizeGroups({ theme: room.get('theme') ?? room.get('title') ?? '', groups }), groups.map(g => g.group)))
+        .catch(() => { overviewFailed = true; return { groups: [], suggestions: [] } as LiveOverview; })
+      : Promise.resolve(overview);
     try {
       points = await trackJob(deps, 'points', jobId, () => gemini.findPoints(ops.docs.map((d) => d.get('text')), msgs.docs.map((d) => d.get('text'))));
+      overview = await overviewJob;
     } catch {
       await finishAnalysis(roomId, 'analysis', jobId, (tx) => {
         tx.update(roomRef(roomId), { 'analysis.status': 'failed', 'analysis.error': 'gemini_unavailable' });
@@ -40,11 +52,15 @@ export function registerAnalysisRoutes(app: Express, deps: Dependencies, guards:
     const saved = await finishAnalysis(roomId, 'analysis', jobId, async (tx) => {
       const existing = await tx.get(insightsRef);
       const decided = new Set(existing.docs.filter((d) => d.get('status') !== 'pending').map((d) => d.get('summary') as string));
-      fresh = [...new Set(points.filter((x) => !x.discussed).map((x) => x.summary))].filter((s) => !decided.has(s));
+      const candidates = [...points.filter(x => !x.discussed).map(x => ({ summary: x.summary, kind: 'missing' })), ...overview.suggestions];
+      const kinds = new Map(candidates.map(c => [c.summary, c.kind]));
+      fresh = [...kinds.keys()].filter(s => !decided.has(s));
       for (const d of existing.docs) if (d.get('status') === 'pending') tx.delete(d.ref);
       for (const summary of fresh) {
-        tx.set(insightsRef.doc(), { summary, status: 'pending', jobId, source: gemini.source, createdAt: FieldValue.serverTimestamp() });
+        tx.set(insightsRef.doc(), { summary, kind: kinds.get(summary), status: 'pending', jobId, source: gemini.source, createdAt: FieldValue.serverTimestamp() });
       }
+      // 補助が失敗したときは、最後に成功したグループの軸を残す
+      if (!overviewFailed) tx.set(db.doc(`sessions/${roomId}/results/live-groups`), { groups: overview.groups, source: gemini.source, jobId, updatedAt: FieldValue.serverTimestamp() });
       tx.set(db.doc(`sessions/${roomId}/results/coverage`), {
         total: points.length, discussed: points.filter((x) => x.discussed).length,
         // 教員の画面に「話された論点／まだの論点」を出すため、Gemini が言い換えた論点を残す（事前意見の本文は入れない。教員だけが読める）
@@ -134,7 +150,7 @@ export function registerAnalysisRoutes(app: Express, deps: Dependencies, guards:
       const clusters = cmp.groups
         .map((c, ci) => ({ label: c.label, count: idx.filter((i) => clusterOf.get(i) === ci).length }))
         .filter((c) => c.count > 0);
-      return { group: gi + 1, respondents: idx.length, clusters, alignmentRate: alignmentRate(clusters.map((c) => ({ members: Array.from({ length: c.count }, (_, k) => k) })), idx.length) };
+      return { group: gi + 1, respondents: idx.length, clusters, alignmentRate: alignmentRate(clusters.map((c) => ({ members: Array.from({ length: c.count }, (_, k) => k) })), idx.length), agreement: agreementSummary(idx.map((i) => stmts.docs[i].get('agreement'))) };
     });
     const summary = {
       respondents: stmts.size,
@@ -143,6 +159,7 @@ export function registerAnalysisRoutes(app: Express, deps: Dependencies, guards:
       metrics: {
         reflectionRate: coverage.exists ? coverage.get('reflectionRate') : null,
         alignmentRate: alignmentRate(cmp.groups, stmts.size),
+        agreement: agreementSummary(stmts.docs.map((d) => d.get('agreement'))),
         participationFairness: participationFairness(counts),
         interventionEffectiveness: interventionEffectiveness(approved.size, new Set(cmp.addressedInsightIds).size),
       },

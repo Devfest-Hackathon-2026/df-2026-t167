@@ -114,6 +114,7 @@ test("スマホの幅でも、ログインと参加の画面が横にはみ出�
   await loginStudent(page);
   for (const path of ["/student", "/join"]) {
     await page.goto(path);
+    // /student は学生のホームへ。ホームの中に参加コードの入力がある（Figma 02-S）
     await expect(page.getByLabel("参加コード")).toBeVisible();
     const { scroll, width } = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, width: window.innerWidth }));
     expect(scroll, `${path} の横幅`).toBeLessThanOrEqual(width);

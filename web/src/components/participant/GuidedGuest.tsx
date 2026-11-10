@@ -1,44 +1,51 @@
 "use client";
 import { AppShell, Stepper } from "@/components/shell";
 import { SpeakerCapture } from "@/lib/speaker-capture";
-import { GuestSpeaking } from "@/components/Speaking";
 import { useEffect, useRef, useState } from "react";
 import { callApi } from "@/lib/api";
 import { authenticatedFetch } from "@/lib/session";
-import { useDoc, useCountdown, useInsights, millis, type Room, type GroupResult } from "@/lib/room";
-import { ConsensusStep, DiscussionNotes, OpinionStep, ResultStep } from "./steps";
+import { useDoc, useCountdown, useInsights, millis, isRecordingLive, type Room, type GroupConfig, type GroupResult } from "@/lib/room";
+import { DiscussionClock } from "@/components/DiscussionClock";
+import { ConsensusStep, DiscussionNotes, OpinionStep, ResultStep, ThemeCard } from "./steps";
+import { READ_ALOUD } from "@/lib/read-aloud";
 import type { useGroupRecording } from "@/lib/recording";
 import { registerRecordingGuard } from "@/lib/recording-recovery";
 interface Own { voiceSource?: "mock" | "model"; displayName?: string; deviceMode?: "personal" | "shared"; ready?: boolean; attendees?: { id: string; displayName: string; voiceRegistered: boolean }[] }
-export function GuidedGuest({ roomId, room, uid, group, recording, canRecord, recorder }: { roomId: string; room: Room; uid: string; group?: number; recording: ReturnType<typeof useGroupRecording>; canRecord: boolean; recorder?: { mine: boolean; name?: string } }) {
+export function GuidedGuest({ roomId, room, uid, group, recording, canRecord, recorder }: { roomId: string; room: Room; uid: string; group?: number; recording: ReturnType<typeof useGroupRecording>; canRecord: boolean; recorder?: { mine: boolean; name?: string } & Pick<GroupConfig, "recordingActive" | "recordingSeenAt"> }) {
   const own = useDoc<Own>(`sessions/${roomId}/members/${uid}`).data;
   // 合意の一文から出るグループの結果（終了後）と、教員が承認した問いかけ（議論中）
   const result = useDoc<GroupResult>(group ? `sessions/${roomId}/results/group-${group}` : undefined).data;
   const insights = useInsights(roomId, true, true);
   const status = group ? room.groupState?.[String(group)]?.status : undefined;
-  // 音声登録は任意。「あとで登録する」を選んだことはこの端末に覚えておく
-  const skipKey = `t167:voice-skip:${roomId}:${uid}`;
-  const [voiceSkipped, setVoiceSkipped] = useState(false);
-  useEffect(() => { try { setVoiceSkipped(localStorage.getItem(skipKey) === "1"); } catch { /* 保存できなくても進める */ } }, [skipKey]);
-  const skipVoice = () => { try { localStorage.setItem(skipKey, "1"); } catch { /* 保存できなくても進める */ } setVoiceSkipped(true); };
   const [names, setNames] = useState([""]), [mode, setMode] = useState<"personal" | "shared">("personal");
   const [error, setError] = useState(""), [busy, setBusy] = useState(false), [registering, setRegistering] = useState<string>(), [consent, setConsent] = useState(false);
+  // 読み上げる文は画面を開くたびに選び直す。サーバーの描画と食い違わないよう、最初は1つ目にしておく
+  const [readAloud, setReadAloud] = useState(0);
+  useEffect(() => setReadAloud(Math.floor(Math.random() * READ_ALOUD.length)), []);
   const [registrationSeconds, setRegistrationSeconds] = useState(0);
   const [registrationMode, setRegistrationMode] = useState<"mic" | "file">("mic");
   const [recordingConsent, setRecordingConsent] = useState(false);
   const stream = useRef<MediaStream | undefined>(undefined), sample = useRef<MediaRecorder | undefined>(undefined);
   const { state: recorderState, capture: recordingCapture } = recording.rec;
   const [speakerStatus, setSpeakerStatus] = useState("");
+  const [speakerRetry, setSpeakerRetry] = useState(0);
   useEffect(() => {
     if (recorderState !== "recording" || !canRecord || room.endedAt) return;
     const capture = recordingCapture();
     if (!capture.stream || !capture.context) return;
-    const speaker = new SpeakerCapture(roomId, setSpeakerStatus);
+    // 話者の照合が止まったら（混雑・前の接続が残っている・通信の途切れなど）、録音中は10秒後に始め直す。
+    // 止まったままにすると、その議論の残りの発言率が集計されなかった（2026-11-10）
+    let retry: ReturnType<typeof setTimeout> | undefined, closed = false;
+    const again = (message: string) => {
+      setSpeakerStatus(`${message}（10秒後に照合を再開します。録音は続いています）`);
+      if (!closed && !retry) retry = setTimeout(() => setSpeakerRetry((n) => n + 1), 10_000);
+    };
+    const speaker = new SpeakerCapture(roomId, again);
     setSpeakerStatus("登録した声と照合しています（推定）。");
-    void speaker.start(capture.stream, capture.context).catch((e: Error) => { setSpeakerStatus(e.message); void speaker.stop(); });
+    void speaker.start(capture.stream, capture.context).catch((e: Error) => { void speaker.stop(); again(e.message); });
     const off = registerRecordingGuard(() => speaker.stop());
-    return () => { off(); void speaker.stop(); };
-  }, [recorderState, recordingCapture, canRecord, room.endedAt, roomId]);
+    return () => { closed = true; clearTimeout(retry); off(); void speaker.stop(); };
+  }, [recorderState, recordingCapture, canRecord, room.endedAt, roomId, speakerRetry]);
   const clock = useCountdown(millis(room.startedAt), room.minutes ?? 15);
   useEffect(() => {
     const stop = async () => { if (sample.current?.state === "recording") sample.current.stop(); stream.current?.getTracks().forEach((t) => t.stop()); };
@@ -83,9 +90,11 @@ export function GuidedGuest({ roomId, room, uid, group, recording, canRecord, re
   const ended = !!room.endedAt || room.phase === "closed";
   const waiting = room.phase === "collecting";
   const named = !!own?.attendees?.length;
-  // 途中から参加した人は、声を登録せずに議論へ進む（議論中の話者の推定には加えない）
+  // 録音する部屋では、声の登録は必須（登録していない人の声は、話者の推定でだれのものか分からないため。MVPフロー「初回だけ：音声登録」）。
+  // 録音しない部屋・話者モデルがない環境では登録しない。途中から参加した人は、声を登録せずに議論へ進む（議論中の話者の推定の名簿を変えないため）
   const late = room.phase !== "collecting";
-  const voiced = !!own?.ready || voiceSkipped || late;
+  const voiceRequired = room.recording !== false && !!own?.voiceSource;
+  const voiced = !!own?.ready || late || !voiceRequired;
   const gs = group ? room.groupState?.[String(group)] : undefined;
   // 進み具合（Figma「最新」）：事前意見（表示名・声・意見）→ 議論 → 結論 → 結果
   const STEPS = ["事前意見", "議論", "結論", "結果"];
@@ -119,9 +128,31 @@ export function GuidedGuest({ roomId, room, uid, group, recording, canRecord, re
     try { await callApi(`/rooms/${roomId}/groups/recorder`, { take: false }); }
     catch (e) { setError((e as Error).message); }
   }
+  // 担当の端末は、いま録音しているかを送る。録音中は20秒ごとに送り直し、止まったら false を送る
+  // （ほかの人の画面は、最後の送信から60秒以内だけ「録音中です」と出す）
+  const mine = !!recorder?.mine, endedAt = millis(room.endedAt);
+  // 送信は順番に行う（「止めた」が「録音中」より後に届いて、表示が逆にならないように）
+  const beats = useRef(Promise.resolve());
+  useEffect(() => {
+    if (!mine || endedAt || recorderState === "asking") return;
+    const active = recorderState === "recording";
+    const send = () => { beats.current = beats.current.then(() => callApi(`/rooms/${roomId}/groups/recorder`, { take: true, active })).then(() => {}, () => { /* 次の送信でやり直す */ }); };
+    send();
+    if (!active) return;
+    const t = setInterval(send, 20_000);
+    return () => clearInterval(t);
+  }, [mine, recorderState, endedAt, roomId]);
+  // ほかの人の端末：担当の端末からの送信が途切れたら、60秒で「録音中」の表示を戻す
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { if (canRecord) return; const t = setInterval(() => setNow(Date.now()), 5_000); return () => clearInterval(t); }, [canRecord]);
+  const othersRecording = !canRecord && isRecordingLive(recorder, now);
+  // 止まった録音・画面を開き直す前の録音が端末にあれば、続きを録る（区間を増やす）
+  const resumable = recorderState === "stopped" || recording.saved.count > 0;
   const leave = () => !recording.unsaved || window.confirm("録音がまだ送られていません。ホームに戻ると、録音は送られず分析されません。戻りますか？");
   const uploadState = recording.upload.state;
   const who = [own?.displayName, group && (room.groups ?? 1) > 1 ? `グループ${group}` : ""].filter(Boolean).join("・");
+  // テーマは、意見・議論・結論の画面の上に大きく出す。教員がテーマを隠した部屋では出さない
+  const theme = room.participantView?.theme !== false ? room.theme?.trim() : "";
   return <AppShell eyebrow={who || undefined} title={room.participantView?.theme === false ? room.title : room.theme || room.title}
     steps={<Stepper steps={STEPS} current={step} />} back="/home" onLeave={leave}>
     <div className="flow">
@@ -132,7 +163,7 @@ export function GuidedGuest({ roomId, room, uid, group, recording, canRecord, re
         {["uploading", "waiting", "done"].includes(uploadState) && <p className="notice" role="status">{uploadState === "done" ? "録音の送信・分析が完了しました。" : uploadState === "waiting" ? "グループの分析結果を待っています。録音は端末に保持しています。" : "録音を送信して分析しています。画面を閉じずにお待ちください。"}</p>}
         {uploadState === "failed" && <div className="notice notice--error stack"><p role="alert">{recording.upload.message}</p><button className="btn" onClick={() => void recording.retry()}>録音を再送する</button></div>}
         {!group ? <p className="notice">グループに入っていなかったため、結果はありません。</p>
-          : !result && status !== "done" ? <ConsensusStep bare roomId={roomId} uid={uid} title={room.theme || room.title} submitted={gs?.submitted} total={gs?.total} />
+          : !result && status !== "done" ? <>{theme && <ThemeCard theme={theme} />}<ConsensusStep bare roomId={roomId} uid={uid} title={room.theme || room.title} submitted={gs?.submitted} total={gs?.total} /></>
           : !room.resultsPublished ? <p className="notice">結果は教員が公開すると表示されます。</p>
           : <ResultStep roomId={roomId} uid={uid} group={group} title={room.theme || room.title} result={result ?? null}
             showSpeaking={room.participantView?.speaking === true} />}
@@ -156,9 +187,9 @@ export function GuidedGuest({ roomId, room, uid, group, recording, canRecord, re
       : !voiced ? <section className="flow-card" aria-labelledby="voice-title">
         <h2 id="voice-title" className="flow-card__title">声の登録</h2>
         <p className="flow-card__lead">{shared ? "1人ずつ、次の文を9秒で読み上げてください。" : "次の文を9秒で読み上げてください。"}</p>
-        <p className="read-aloud">私たちは、お互いの意見を聞き、理由を考えながら、よりよいアイデアを見つけます。</p>
+        <p className="read-aloud">{READ_ALOUD[readAloud]}</p>
         <label className="check"><input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} /><span>声の特徴の登録と、上記の利用方法に同意します</span></label>
-        <details><summary className="t-small">声の使い方</summary><p className="t-small">{shared ? "話し合いの発言時間の推定に使い、セッションの終了時に削除します。" : "話し合いの発言時間の推定に使います。声の特徴だけをこのアカウントに保存し、次回も使います。音声そのものは保存しません。"}</p></details>
+        <details><summary className="t-small">声の使い方</summary><p className="t-small">{shared ? "話し合いの発言時間の推定に使い、セッションの終了時に削除します。" : "この議論の発言時間の推定に使います。声の特徴だけを保存し、音声そのものは保存しません。議論ごとに登録し直します（その日・その場所の声で照合するため）。"}</p></details>
         {own!.attendees!.map((a) => <div className="stack stack--tight" key={a.id}>
           {own!.attendees!.length > 1 && <p className="t-label">{a.displayName}</p>}
           <button className="mic" data-done={a.voiceRegistered || undefined} disabled={!consent || !!registering || a.voiceRegistered} onClick={() => void enroll(a.id)}>
@@ -168,42 +199,59 @@ export function GuidedGuest({ roomId, room, uid, group, recording, canRecord, re
           <details><summary className="t-small">録音済みの音声から登録する</summary><p className="t-small">本人だけが話す8〜12秒、1MB以内の音声を選んでください。</p><input type="file" accept="audio/*" aria-label={`${a.displayName}の登録用音声ファイル`} disabled={!consent || !!registering || a.voiceRegistered} onChange={(e) => { const file = e.target.files?.[0]; e.target.value = ""; if (file) void enroll(a.id, file); }} /></details>
         </div>)}
         {own!.voiceSource === "mock" && <p className="t-small">ローカルでは音声登録のモックを使います。実際の声の識別精度を表すものではありません。</p>}
-        <button type="button" className="text-btn" disabled={!!registering} onClick={skipVoice}>あとで登録する</button>
       </section>
 
       : waiting ? (!group
         ? <p className="notice" role="status">グループの割り当てを待っています。</p>
-        : <OpinionStep bare roomId={roomId} uid={uid} total={gs?.total} opinions={gs?.opinions} canChange={false} onChangeGroup={() => {}} />)
+        : <>{theme && <ThemeCard theme={theme} />}<OpinionStep bare roomId={roomId} uid={uid} total={gs?.total} opinions={gs?.opinions} canChange={false} onChangeGroup={() => {}} /></>)
 
       : <>
-        <section className="talk-hero" aria-labelledby="talk-title">
-          <h2 id="talk-title" className="talk-hero__title">グループで話し合いましょう</h2>
-          {room.participantView?.theme !== false && room.theme && <p className="talk-hero__theme">テーマ：{room.theme}</p>}
-          {room.participantView?.timer !== false && room.endsAt && <p className="talk-hero__timer" role="timer">残り時間 {clock.text}</p>}
-        </section>
+        {/* 主役はテーマ。「グループで話し合いましょう」は、テーマの上の小さい見出しにする */}
+        {theme ? <ThemeCard theme={theme} heading="グループで話し合いましょう" /> : <h2 className="talk-hero__title">グループで話し合いましょう</h2>}
+        {/* 時間は録音のカードの丸に出す。録音しない部屋では、ここに1行で出す（残り時間か経過時間を、つねに表示） */}
+        {room.recording === false && <DiscussionClock room={room} variant="line" />}
         {/* 教員が承認した問いかけ（まだ話されていない論点）は、届いたらメモより上に出す */}
         {insights.length > 0 && question}
         <DiscussionNotes bare roomId={roomId} />
         {canRecord && room.recording !== false && (
           <section className="flow-card record-card" aria-labelledby="record-title">
             <h2 id="record-title" className="t-sm">{recorder?.mine ? "録音（この端末が担当）" : "録音"}</h2>
+            <DiscussionClock room={room} />
             {!recorder?.mine && <p className="t-small">録音はグループで1台です。この端末で録音すると、ほかの人の画面に、この端末が担当だと出ます。</p>}
             <label className="check"><input type="checkbox" checked={recordingConsent} onChange={(e) => { setRecordingConsent(e.target.checked); if (!e.target.checked) void recording.discard(); }} /><span>グループ全員が録音・声の照合・発言時間の集計に同意しました</span></label>
             <p className="t-small">録音はグループで1台です。同意を取り消すと、ここまでの録音は送らずに削除します。</p>
             <div className="home-actions">
-              <button className="btn btn--blue" disabled={!recordingConsent || claiming || ["asking", "recording", "stopped"].includes(recording.rec.state)} onClick={() => void startRecording()}>{recording.rec.state === "recording" ? "録音中" : recording.rec.state === "stopped" ? "録音は停止済みです" : "録音を始める"}</button>
+              <button className="btn btn--blue" disabled={!recordingConsent || claiming || ["asking", "recording"].includes(recording.rec.state)} onClick={() => void startRecording()}>{recording.rec.state === "recording" ? "録音中" : resumable ? "録音を再開する" : "録音を始める"}</button>
               {recorderState === "recording" && <button className="btn" onClick={() => void recording.rec.stop()}>録音を停止して端末に保管</button>}
-              {recorder?.mine && ["idle", "denied", "unsupported"].includes(recorderState) && <button className="btn" onClick={() => void releaseRecorder()}>録音の担当をやめる</button>}
+              {recorder?.mine && !recording.saved.count && ["idle", "denied", "unsupported"].includes(recorderState) && <button className="btn" onClick={() => void releaseRecorder()}>録音の担当をやめる</button>}
             </div>
+            {/* 録音が止まっても、議論中は続きを録れる。止まるまでの録音は端末に残し、議論が終わったらまとめて送る */}
+            {recorderState !== "recording" && recording.rec.interrupted && <p className="notice notice--error" role="alert">録音が止まりました（画面が消えた、別のアプリに切り替えたなど）。ここまでの録音はこの端末に残っています。「録音を再開する」を押して続けてください。</p>}
+            {recorderState !== "recording" && !recording.rec.interrupted && recording.saved.count > 0 && <p className="t-small" role="status">この端末に、ここまでの録音が残っています。続けるときは「録音を再開する」を押してください。議論が終わると、まとめて送ります。</p>}
             {speakerStatus && <p className="t-small" role="status">{speakerStatus}</p>}
             {recording.rec.saveError && <p className="notice notice--error" role="alert">{recording.rec.saveError}</p>}
           </section>
         )}
-        {!canRecord && room.recording !== false && <p className="notice" role="status">{recorder?.name ? `${recorder.name}さんの端末が録音を担当しています。` : "録音は、グループの別の端末が担当しています。"}</p>}
+        {/* Figma「最新」P3（他の人が録音中）345:44：誰の端末が録音しているかを、名前で出す（アプリフィードバック「誰が録音しているか分からない」）。
+            赤い点と「録音中です」は、担当の端末がいま録音しているときだけ。担当が決まっただけ・止めたときは「担当しています」にする */}
+        {!canRecord && room.recording !== false && (
+          <section className="flow-card record-card" aria-labelledby="other-recording-title">
+            <h2 className="t-sm">録音</h2>
+            <DiscussionClock room={room} />
+            <div className="other-recording" data-live={othersRecording || undefined}>
+              <p id="other-recording-title" className="other-recording__title" aria-live="polite">
+                {othersRecording && <span className="other-recording__dot" aria-hidden="true" />}
+                {othersRecording ? `${recorder?.name ? `${recorder.name}さん` : "グループの別の端末"}が録音中です` : `${recorder?.name ? `${recorder.name}さんの端末` : "グループの別の端末"}が録音を担当しています`}
+              </p>
+              <p className="t-small">{othersRecording ? "録音はグループで1台です。この端末では録音しません。" : "いまは録音していません。"}録音の開始・停止と同意の取り消しは、担当の端末で行います。</p>
+              <button type="button" className="btn" disabled>録音を始める</button>
+            </div>
+          </section>
+        )}
         {insights.length === 0 && question}
       </>}
 
-      {group && room.participantView?.speaking === true && !ended && <GuestSpeaking roomId={roomId} group={group} />}
     </div>
   </AppShell>;
 }
+

@@ -294,6 +294,8 @@ describe('グループごとの進行', () => {
     expect(r2.body).toMatchObject({ ready: true, analyzed: true, submitted: 2, total: 2 });
     const result = (await db.doc(`sessions/${roomId}/results/group-1`).get()).data();
     expect(result).toMatchObject({ group: 1, respondents: 2, alignmentRate: 0.5, source: 'mock' });
+    // 2人では納得度の分布・平均を出さない（自分の値から相手の値が分かるため）
+    expect(result?.agreement).toEqual({ respondents: 2, counts: null, average: null });
     expect(result?.clusters).toHaveLength(2);
     expect((await db.doc(`sessions/${roomId}`).get()).get('groupState')['1'].status).toBe('done');
   });
@@ -385,6 +387,28 @@ describe('録音の分析', () => {
     expect(JSON.stringify(flow)).not.toContain(uidOf(p1)); // 話者を記録しない
     expect((await db.doc(`sessions/${roomId}`).get()).get('groupState')['1'].recording.status).toBe('done');
     await upload(p2, roomId).expect(409); // 同じグループの2台目の送信は分析しない
+  });
+  it('途中で止まって続きを録った録音は、区間ごとに確かめ、読めない区間だけを除いて、測った長さの合計で分析する', async () => {
+    const { roomId, p1 } = await discussingRoom();
+    const parts = [wave(300), Buffer.alloc(2000, 7), wave(240)]; // 2つ目は、画面を開き直す前の読めない区間
+    const send = (q: string, body = Buffer.concat(parts)) => request(app).post(`/rooms/${roomId}/groups/recording?${q}`)
+      .set('authorization', `Bearer ${p1}`).set('cookie', cookies.get(p1) ?? '').set('content-type', 'audio/wav').send(body);
+    const sizes = parts.map((p) => p.length).join(',');
+    await send(`consent=1&durationSec=600&parts=${parts[0].length},${parts[1].length}`).expect(400); // 区間の合計が本文と合わない
+    await send(`consent=1&durationSec=600&parts=${sizes},1000`).expect(400);
+    await send(`consent=1&durationSec=10&parts=${Array(9).fill(1000).join(',')}`, Buffer.alloc(9000, 1)).expect(400); // 区間は8つまで
+    await send(`consent=1&durationSec=10&parts=1000,1000`, Buffer.alloc(2000, 1)).expect(400); // どの区間も読めない
+    expect((await db.doc(`sessions/${roomId}`).get()).get('groupState')?.['1']?.recording).toBeUndefined(); // 分析を始めていない
+    // 端末の見積もり（durationSec）と合わなくても、測った長さ（300秒＋240秒＝9分）を使う
+    const r = await send(`consent=1&durationSec=700&parts=${sizes}`).expect(200);
+    expect(r.body).toMatchObject({ group: 1, status: 'done', totalMinutes: 9 });
+    expect((await db.doc(`sessions/${roomId}/results/flow-g1`).get()).data()).toMatchObject({ durationSec: 540, recordingParts: 2 });
+  });
+  it('区間の長さの合計が30分を超える録音は分析しない', async () => {
+    const { roomId, p1 } = await discussingRoom();
+    const parts = [wave(1000), wave(900)];
+    await request(app).post(`/rooms/${roomId}/groups/recording?consent=1&durationSec=1800&parts=${parts.map((p) => p.length).join(',')}`)
+      .set('authorization', `Bearer ${p1}`).set('cookie', cookies.get(p1) ?? '').set('content-type', 'audio/wav').send(Buffer.concat(parts)).expect(413);
   });
   it('事前の意見と照らし合わせた論点は、先生だけが読む results/points-g{番号} に保存し、意見の本文を写さない', async () => {
     const { roomId, mod, p1, p2 } = await setupRoom(true);
@@ -519,9 +543,10 @@ describe('承認と合意の検証', () => {
     expect(r.body.metrics).toMatchObject({ reflectionRate: 0.5, alignmentRate: 0.5, interventionEffectiveness: 1 });
     expect(r.body.metrics.participationFairness).toBeGreaterThan(0);
     expect(r.body.source).toBe('mock');
-    expect(r.body.byGroup).toEqual([{ group: 1, respondents: 2, alignmentRate: 0.5, clusters: [
+    expect(r.body.byGroup).toEqual([{ group: 1, respondents: 2, alignmentRate: 0.5, agreement: { respondents: 2, counts: null, average: null }, clusters: [
       { label: expect.any(String), count: 1 }, { label: expect.any(String), count: 1 },
     ] }]);
+    expect(r.body.metrics.agreement).toEqual({ respondents: 2, counts: null, average: null });
   });
 });
 
@@ -771,5 +796,37 @@ describe('Zod・Admin SDK更新後のAPI互換性', () => {
   it.each([{ groups: '2' }, { recording: 'false' }, { title: '' }])('入力の型・必須値の制約を維持する: %j', async (patch) => {
     const result = await api(await named()).post('/rooms', { title: '依存更新の確認', ...patch }).expect(400);
     expect(result.body.error.code).toBe('bad_request');
+  });
+});
+
+describe('グループごとの議論の軸', () => {
+  it('公開メモだけを所属別に分析し、結果と提案の種別をHostだけに返す', async () => {
+    const { roomId, mod, p1, p2 } = await setupRoom();
+    await db.doc(`sessions/${roomId}`).update({ groups: 2 });
+    await db.doc(`sessions/${roomId}/members/${uidOf(p1)}`).update({ group: 1, groupId: '1' });
+    await db.doc(`sessions/${roomId}/members/${uidOf(p2)}`).update({ group: 2, groupId: '2' });
+    await toDiscussing(mod, roomId, ['本人だけの意見マーカー'], [[uidOf(p1), '公開メモ1'], [uidOf(p2), '公開メモ2']]);
+    const summarizeGroups = vi.fn(async () => ({ groups: [{ group: 1, focus: '学習への影響', points: ['考える時間'] }, { group: 2, focus: '利用環境', points: ['参加する方法'] }], suggestions: [{ kind: 'new_angle' as const, summary: '運用後の検証を考える' }] }));
+    const target = createApp({ db, auth: getAuth(), gemini: { ...mockGemini(), summarizeGroups }, now: () => clock });
+    await request(target).post(`/rooms/${roomId}/analyze`).set('authorization', `Bearer ${mod}`).set('cookie', cookies.get(mod)!).send({}).expect(200);
+    const input = summarizeGroups.mock.calls[0];
+    expect(JSON.stringify(input)).not.toContain('本人だけの意見マーカー');
+    expect(summarizeGroups).toHaveBeenCalledWith(expect.objectContaining({ groups: [{ group: 1, messages: ['公開メモ1'] }, { group: 2, messages: ['公開メモ2'] }] }));
+    const result = (await db.doc(`sessions/${roomId}/results/live-groups`).get()).data()!;
+    expect(result.groups.map((g: { focus: string }) => g.focus)).toEqual(['学習への影響', '利用環境']);
+    const suggestions = await db.collection(`sessions/${roomId}/insights`).where('kind', '==', 'new_angle').get(); expect(suggestions.size).toBe(1);
+    await db.doc(`sessions/${roomId}`).update({ resultsPublished: true });
+    await request(app).get(`/rooms/${roomId}/results/live-groups`).set('authorization', `Bearer ${p1}`).set('cookie', cookies.get(p1)!).expect(403);
+    await request(app).get(`/rooms/${roomId}/results/live-groups`).set('authorization', `Bearer ${mod}`).set('cookie', cookies.get(mod)!).expect(200);
+  });
+  it('グループ分析（補助）が失敗しても、未検討の論点（中核）は保存し、グループの軸は最後に成功した結果を保つ', async () => {
+    const { roomId, mod, p1 } = await setupRoom();
+    await toDiscussing(mod, roomId, [], [[uidOf(p1), '公開メモ']]);
+    const ref = db.doc(`sessions/${roomId}/results/live-groups`); await ref.set({ groups: [{ group: 1, focus: '前回の軸', points: [] }], source: 'mock' });
+    const target = createApp({ db, auth: getAuth(), gemini: { ...mockGemini(), summarizeGroups: async () => { throw new Error('provider-internal-marker'); } }, now: () => clock });
+    const response = await request(target).post(`/rooms/${roomId}/analyze`).set('authorization', `Bearer ${mod}`).set('cookie', cookies.get(mod)!).send({}).expect(200);
+    expect(JSON.stringify(response.body)).not.toContain('provider-internal-marker'); expect((await ref.get()).get('groups')[0].focus).toBe('前回の軸');
+    expect((await db.doc(`sessions/${roomId}/results/coverage`).get()).exists).toBe(true);
+    expect((await db.doc(`sessions/${roomId}`).get()).get('analysis.status')).toBe('done');
   });
 });

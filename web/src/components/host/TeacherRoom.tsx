@@ -9,6 +9,7 @@ import { ApiError, callApi } from "@/lib/api";
 import { millis, useDoc, useGroupResults, useInsights, useMembers, type Flow, type GroupPoints, type GroupResult, type Room, type Summary } from "@/lib/room";
 import { ClassResult, GroupResultView } from "./HostRoom";
 import { LiveBoard } from "./LiveBoard";
+import { GroupCards } from "./GroupCards";
 import { HostSpeaking } from "@/components/Speaking";
 import { SessionSettings } from "./SessionSettings";
 
@@ -39,7 +40,7 @@ export function TeacherRoom({ roomId, room }: { roomId: string; room: Room }) {
   }, [room.endsAt, room.phase, ended, roomId]);
 
   return (
-    <AppShell wide back="/teacher"
+    <AppShell wide back="/home"
       eyebrow={<>{room.className && <span>{room.className}</span>}<span className={`pill pill--${state === "議論中" ? "live" : state === "終了" ? "done" : "ready"}`}>{state}</span></>}
       title={room.theme || room.title}
       actions={<>
@@ -49,16 +50,16 @@ export function TeacherRoom({ roomId, room }: { roomId: string; room: Room }) {
         </button></>}>
 
       {room.phase === "collecting" && <Lobby roomId={roomId} room={room} seats={seats} opinions={opinions} />}
-      {!ended && room.phase !== "collecting" && <LiveBoard roomId={roomId} room={room} members={members} insights={insights} />}
+      {!ended && room.phase !== "collecting" && <LiveBoard roomId={roomId} room={room} members={members} insights={insights} results={results} />}
       {ended && (openGroup
-        ? <div className="teacher__body"><button className="text-btn" onClick={() => setOpenGroup(undefined)}>セッション全体に戻る</button><GroupResultView result={results.find((r) => r.group === openGroup) ?? null} group={openGroup} roomId={roomId} source={source} /></div>
+        ? <div className="teacher__body"><button className="btn back-btn" onClick={() => setOpenGroup(undefined)}>クラス全体に戻る</button><GroupResultView result={results.find((r) => r.group === openGroup) ?? null} group={openGroup} roomId={roomId} source={source} /></div>
         : <div className="teacher__body">
           {/* いまやることを1つだけ大きく：結論の提出待ち → 結果をまとめる。データのない欄は出さない */}
-          <EndedFocus roomId={roomId} room={room} results={results} summary={summary ?? null} />
+          <EndedFocus roomId={roomId} room={room} results={results} summary={summary ?? null} onOpen={setOpenGroup} />
           {results.length > 0 && <ClassResult roomId={roomId} room={room} results={results} summary={summary ?? null} onOpen={setOpenGroup} />}
           <HostSpeaking roomId={roomId} card ended />
           <RecordingReview roomId={roomId} room={room} />
-          <p><Link className="text-btn" href="/teacher">教員のホームに戻る</Link></p>
+          <p><Link className="text-btn" href="/home">ホームに戻る</Link></p>
         </div>)}
 
       <dialog ref={settings} className="dialog" aria-labelledby="settings-title" onClick={(e) => { if (e.target === settings.current) settings.current?.close(); }}>
@@ -114,7 +115,7 @@ function Lobby({ roomId, room, seats, opinions }: { roomId: string; room: Room; 
  * 終了後の主役。学生が結論を書いているあいだは提出の進み具合、全グループがそろったら「結果をまとめる」、
  * まとめたあとは目立たない帯（まとめ直す）にする。
  */
-function EndedFocus({ roomId, room, results, summary }: { roomId: string; room: Room; results: GroupResult[]; summary: Summary | null }) {
+function EndedFocus({ roomId, room, results, summary, onOpen }: { roomId: string; room: Room; results: GroupResult[]; summary: Summary | null; onOpen: (group: number) => void }) {
   const [busy, setBusy] = useState<string>(), [message, setMessage] = useState("");
   const groups = Array.from({ length: room.groups ?? 1 }, (_, i) => i + 1);
   const states = groups.map((g) => ({ g, done: results.some((r) => r.group === g), submitted: room.groupState?.[String(g)]?.submitted ?? 0, total: room.groupState?.[String(g)]?.total ?? 0 }));
@@ -132,13 +133,8 @@ function EndedFocus({ roomId, room, results, summary }: { roomId: string; room: 
       {busy === "all" || running ? "まとめています…" : label}
     </button>
   );
-  const groupList = (
-    <ul className="ended-hero__groups" aria-label="グループごとの提出">
-      {states.map((s) => <li key={s.g} data-done={s.done || undefined}><span>グループ{s.g}：{s.done ? "結果あり" : `提出 ${s.submitted}/${s.total}人`}</span>
-        {!s.done && s.submitted > 0 && <button className="btn btn--small" disabled={!!busy} onClick={() => void run("groups/analyze", { group: s.g }, `g${s.g}`)}>{busy === `g${s.g}` ? "分析しています…" : "今の回答で結果を出す"}</button>}
-      </li>)}
-    </ul>
-  );
+  // グループごとの段階は、ダッシュボードと同じカード（Figma「最新」182:445）で出す：結論を記入中（今の回答で結果を出す）／結果あり（グループを見る）
+  const groupList = <GroupCards roomId={roomId} room={room} groups={groups} results={results} onOpen={onOpen} label="グループごとの提出" />;
   const error = message && <p className="notice notice--warn" role="alert">{message}</p>;
   if (summary) return (
     <section className="ended-hero ended-hero--quiet" aria-labelledby="ended-title">

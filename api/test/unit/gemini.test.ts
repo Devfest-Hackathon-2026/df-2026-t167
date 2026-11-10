@@ -114,6 +114,14 @@ describe('実SDK接続部分のモック検査', () => {
     expect(result).toMatchObject(responseBody);
     expect(calls.at(-1)!.req.config.abortSignal).toBeInstanceOf(AbortSignal);
   });
+  it('区間に分けた録音は、区間ごとの音声を順に添付し、1つの話し合いとして扱うよう指示する', async () => {
+    const { mockGemini } = await import('../../src/gemini.js');
+    responseBody = await mockGemini().analyzeDiscussion({ audio: Buffer.alloc(1), mimeType: 'audio/webm', durationSec: 60, theme: '架空のテーマ', opinions: [] });
+    await vertexGemini('p', 'global', 'gemini-3.5-flash').analyzeDiscussion({ audio: [Buffer.from('a'), Buffer.from('b')], mimeType: 'audio/webm', durationSec: 60, theme: '架空のテーマ', opinions: [] });
+    const parts = calls.at(-1)!.req.contents[0].parts;
+    expect(parts.slice(1).map((p: { inlineData: { data: string } }) => Buffer.from(p.inlineData.data, 'base64').toString())).toEqual(['a', 'b']);
+    expect(parts[0].text).toContain('2個の音声に分かれています');
+  });
 });
 
 // Zodのメジャー更新でも、AI応答の型を暗黙に変換して受理しないことを固定する。
@@ -134,4 +142,10 @@ it('AI用の環境変数で受け取った認証をVertex SDKへ直接渡せる'
   const credentials = { type: 'service_account' as const, project_id: 'p', client_email: 'dummy@example.com', private_key: 'dummy PRIVATE KEY' }; // submit-allow: SDKモックの検証専用
   await vertexGemini('p', 'global', 'gemini-3.5-flash', credentials).findPoints(['架空の意見'], []);
   expect(calls.at(-1)!.init).toMatchObject({ vertexai: true, project: 'p', googleAuthOptions: { credentials } });
+});
+
+it('グループの公開メモから議論の軸と提案を構造化し、不明なグループは採用しない', async () => {
+  responseBody = { groups: [{ group: 1, focus: '根拠の確かめ方', points: ['情報源の確認'] }, { group: 2, focus: '対象外', points: [] }], suggestions: [{ kind: 'new_angle', summary: '検証後の運用も考える' }] };
+  const result = await vertexGemini('p', 'global', 'gemini-3.5-flash').summarizeGroups({ theme: '架空のテーマ', groups: [{ group: 1, messages: ['公開済みの発言メモ'] }] });
+  expect(result.groups).toHaveLength(1); expect(result.suggestions[0].kind).toBe('new_angle'); expect(JSON.stringify(calls.at(-1)!.req)).toContain('公開済みの発言メモ'); expect(calls.at(-1)!.req.config.responseSchema).toBeDefined();
 });
